@@ -24,6 +24,7 @@ import pandas as pd
 import streamlit as st
 
 from data import sources
+from data import live as live_quote_mod
 import indicators
 import regime
 import backtest
@@ -355,6 +356,40 @@ st.markdown(
     f"{day_change_pct:+.2f}% &nbsp;·&nbsp; as of {last_date}",
     unsafe_allow_html=True,
 )
+
+# ─── Live spot quote ───
+@st.cache_data(show_spinner=False, ttl=30)
+def cached_live_quote(sym: str, _bucket: int) -> dict | None:
+    return live_quote_mod.get_live_quote(sym)
+
+import time as _time_mod
+live = cached_live_quote(symbol, int(_time_mod.time() // 30))
+
+if live and live["price"] > 0:
+    gap_pct = (live["price"] / last_close - 1) * 100
+    is_stale = abs(gap_pct) > 1.0
+    live_color = "#00E68A" if live["change_pct"] >= 0 else "#FF4757"
+    fetched_str = _time_mod.strftime("%H:%M:%S", _time_mod.localtime(live["timestamp"]))
+    stale_note = (
+        f"<span style='color:#FFD93D; margin-left:8px;'>price moved {gap_pct:+.1f}% since model input — signal may be stale</span>"
+        if is_stale else ""
+    )
+    st.markdown(
+        f"""
+        <div style="background:#1A1B24; border:1px solid #2A2B38; border-radius:8px;
+                    padding:10px 14px; margin:0 0 12px 0; font-size:12px;">
+            <span style="font-size:10px; color:#888; letter-spacing:1px;">LIVE</span>
+            &nbsp;<b style="font-size:18px; color:#fff;">${live['price']:,.2f}</b>
+            <span style="color:{live_color}; font-weight:600; margin-left:6px;">
+                {live['change']:+.2f} ({live['change_pct']:+.2f}%)
+            </span>
+            <span style="color:#666; margin-left:6px;">today · range ${live['day_low']:,.2f}–${live['day_high']:,.2f}</span>
+            <span style="color:#666; margin-left:8px; font-size:10px;">refreshed {fetched_str}</span>
+            {stale_note}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # ─── Big recommendation card (XGBoost is the headline) ───
 action_label = {1: "BUY LONG", -1: "SELL SHORT", 0: "STAY FLAT"}[recommendation_call]
