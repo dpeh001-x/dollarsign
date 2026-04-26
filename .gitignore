@@ -1,0 +1,38 @@
+# Secrets — NEVER commit these
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*_secret*
+*credentials*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+*.so
+
+# Caches
+quant/cache/
+backend/cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editor / agents
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/
+*.swp
+
+# Build artifacts
+dist/
+build/
+*.egg
+node_modules/
