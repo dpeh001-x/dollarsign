@@ -302,6 +302,39 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# ─── ATR-based stop suggestion ───
+if recommendation_call != 0:
+    atr_value = df["atr_14"].iloc[-1]
+    if not pd.isna(atr_value) and last_close > 0:
+        atr_pct = float(atr_value) / float(last_close)
+        stop_dist_pct = 2.5 * atr_pct
+        is_long = recommendation_call > 0
+        if is_long:
+            stop_price = last_close * (1 - stop_dist_pct)
+            tp_price = last_close * (1 + stop_dist_pct)
+            stop_dir, tp_dir = "below", "above"
+        else:
+            stop_price = last_close * (1 + stop_dist_pct)
+            tp_price = last_close * (1 - stop_dist_pct)
+            stop_dir, tp_dir = "above", "below"
+        risk_per_share = abs(last_close - stop_price)
+        time_stop = (last_date + timedelta(days=14)).strftime("%b %d")
+        st.markdown(
+            f"""
+            <div style="background:#1A1B24; border:1px solid #2A2B38; border-left:3px solid {action_color};
+                        border-radius:6px; padding:10px 14px; margin:-10px 0 16px 0; font-size:12px; color:#aaa;">
+                <b style="color:#ccc;">Suggested levels</b> <span style="color:#666;">(2.5× ATR, 1:1 R:R)</span>
+                &nbsp;·&nbsp; Entry <b style="color:#fff;">${last_close:.2f}</b>
+                &nbsp;·&nbsp; Stop <b style="color:#FF4757;">${stop_price:.2f}</b>
+                <span style="color:#666;">({stop_dist_pct*100:.1f}% {stop_dir}, risk ${risk_per_share:.2f}/sh)</span>
+                &nbsp;·&nbsp; TP <b style="color:#00E68A;">${tp_price:.2f}</b>
+                <span style="color:#666;">({stop_dist_pct*100:.1f}% {tp_dir})</span>
+                &nbsp;·&nbsp; Time-stop <b style="color:#FFD93D;">{time_stop}</b>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
 # ─── Per-strategy votes ───
 st.subheader("Strategy votes")
 all_calls = {"xgb (ML)": xgb_call, **current_calls}
