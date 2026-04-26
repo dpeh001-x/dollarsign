@@ -36,6 +36,41 @@ import social_scanner
 st.set_page_config(page_title="Long or Short?", page_icon="$", layout="centered")
 
 st.title("Long or Short?")
+st.caption("XGBoost predicts next-10-day direction · Hold up to 30 days · Stop at 2.5×ATR · Min 15% confidence to enter")
+
+with st.expander("How this strategy works", expanded=False):
+    st.markdown(
+        """
+**The model**
+- XGBoost classifier predicts P(price up over next 10 trading days) from technicals + regime + lagged returns
+- Class-pooled training when symbol is equity / broad-ETF / crypto (more data, better generalization)
+- Tuned hyperparameters: horizon=10, max_depth=3, n_estimators=100 (selected by FDR-corrected grid search)
+
+**When to act**
+- **BUY LONG** if P(up) > **0.575** (15%+ confidence above coin-flip)
+- **SELL SHORT** if P(up) < **0.425**
+- **STAY FLAT** otherwise — anything in 0.425–0.575 is noise, model isn't sure
+
+**How to size the trade**
+- Stop loss: **2.5× ATR(14)** against you (volatility-adjusted, tighter for SPY, wider for crypto)
+- Take profit: **2.5× ATR(14)** in your favor (1:1 reward:risk)
+- Time stop: exit after **~30 trading days** (~6 weeks) regardless — model's edge decays past that
+
+**Validated on 12 months × 10 symbols (Setup B)**
+- 56.5% win rate · +16.9% portfolio return · Sharpe 0.97 · Max DD -16.1%
+- 186 trades — fewer than the original 10-bar time stop (265) because longer holds let trades reach take-profit instead of timing out
+
+**Key honest caveat**
+- Strategy underperforms buy-and-hold in strong bull markets (gives up alpha to maintain hedging)
+- Outperforms in bear/crashing markets (e.g., BTC backtest: +23% strategy vs -17% B&H)
+- ~44% of trades will be losers — only manageable with strict ATR stops + position sizing
+- Past backtest performance does not guarantee future results
+
+**Position sizing rule of thumb**
+- Risk **1-2% of account per trade** (use the "risk $/share" number under the recommendation)
+- Example: $10k account, risk $100/trade, AAPL stop $4/share → 25 shares
+        """
+    )
 
 # ─── Trending tickers (apewisdom — Reddit + StockTwits + Twitter aggregator) ───
 with st.expander("Trending tickers", expanded=False):
@@ -362,7 +397,10 @@ if recommendation_call != 0:
             tp_price = last_close * (1 - stop_dist_pct)
             stop_dir, tp_dir = "above", "below"
         risk_per_share = abs(last_close - stop_price)
-        time_stop = (last_date + timedelta(days=14)).strftime("%b %d")
+        # Setup B: 30 trading-day time stop (~42 calendar days). The model predicts
+        # the next 10-day direction, but holding longer captures more of the move
+        # — TP exits jumped from 29% → 49% with the longer time stop in backtests.
+        time_stop = (last_date + timedelta(days=42)).strftime("%b %d")
         st.markdown(
             f"""
             <div style="background:#1A1B24; border:1px solid #2A2B38; border-left:3px solid {action_color};

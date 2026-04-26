@@ -32,15 +32,18 @@ import ml
 import class_xgb
 from data import sources
 
-# ─── Sim parameters ───
-ATR_MULT = 2.5
-TIME_STOP_BARS = 10
-LONG_THRESH = 0.55
-SHORT_THRESH = 0.45
+# ─── Sim defaults (Setup B from 12-month validation) ───
+# Validated config: 56.5% win, +16.9% return, Sharpe 0.97 over 12mo, 10 symbols.
+# 30-bar time stop (vs 10) lets winners run — TP exits jumped 29% → 49%.
+ATR_MULT = 2.5               # set by --atr-mult
+TIME_STOP_BARS = 30          # set by --time-stop  (Setup B)
+HORIZON = 10                 # set by --horizon (model's prediction horizon)
+LONG_THRESH = 0.575          # set by --min-conf  (Setup B: 0.15 conf threshold)
+SHORT_THRESH = 0.425         # set by --min-conf
 FEE_BPS = 1.0
 SLIP_BPS = 1.0
 START_CAPITAL = 10_000.0
-N_MONTHS = 6
+N_MONTHS = 6                 # set by --months
 
 UNIVERSE = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "BTC-USD", "ETH-USD", "XLE", "GLD"]
 
@@ -165,23 +168,44 @@ def get_probas_for_symbol(symbol: str, df: pd.DataFrame, full_start_iso: str) ->
     cls = class_xgb.classify_symbol(symbol)
     if cls in class_xgb.POOL_BENEFITS:
         probas_dict = class_xgb.predict_class(
-            cls, full_start_iso, horizon=10, train_size=750, step_size=60
+            cls, full_start_iso, horizon=HORIZON, train_size=750, step_size=60
         )
         s = probas_dict.get(symbol, pd.Series(dtype=float))
-        # Reindex to df.index
         return s.reindex(df.index)
     else:
-        wf = ml.WalkForwardModel(train_size=500, step_size=60, horizon=10)
+        wf = ml.WalkForwardModel(train_size=500, step_size=60, horizon=HORIZON)
         return wf.fit_predict(df)
 
 
 def main() -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description="Hypothetical portfolio sim with ATR stops + time stops.")
+    parser.add_argument("--months", type=int, default=6, help="Months of history to simulate.")
+    parser.add_argument("--min-conf", type=float, default=0.15,
+                        help="Min model confidence to take a signal (Setup B default 0.15 = P>0.575/<0.425).")
+    parser.add_argument("--horizon", type=int, default=10,
+                        help="Model prediction horizon in trading days.")
+    parser.add_argument("--time-stop", type=int, default=30,
+                        help="Force-exit after this many bars in position (Setup B default 30).")
+    parser.add_argument("--atr-mult", type=float, default=2.5,
+                        help="Stop distance = atr_mult × ATR. TP set symmetrically (1:1 R:R).")
+    args = parser.parse_args()
+
+    global LONG_THRESH, SHORT_THRESH, N_MONTHS, HORIZON, TIME_STOP_BARS, ATR_MULT
+    LONG_THRESH = 0.5 + args.min_conf / 2
+    SHORT_THRESH = 0.5 - args.min_conf / 2
+    N_MONTHS = args.months
+    HORIZON = args.horizon
+    TIME_STOP_BARS = args.time_stop
+    ATR_MULT = args.atr_mult
+
     sim_start_dt = pd.Timestamp.now(tz="UTC") - pd.DateOffset(months=N_MONTHS)
     full_start_iso = (date.today() - timedelta(days=5 * 365)).isoformat()
 
     print(f"\n{'='*82}")
     print(f"  HYPOTHETICAL {N_MONTHS}-MONTH RUN")
-    print(f"  Stop: {ATR_MULT}× ATR · Time stop: {TIME_STOP_BARS} bars · Costs: {FEE_BPS}+{SLIP_BPS} bps/side")
+    print(f"  Model horizon: {HORIZON}d  ·  Stop: {ATR_MULT}× ATR  ·  Time stop: {TIME_STOP_BARS} bars  ·  Costs: {FEE_BPS}+{SLIP_BPS} bps/side")
+    print(f"  Signal thresholds: LONG > {LONG_THRESH:.3f} · SHORT < {SHORT_THRESH:.3f}  (min conf {args.min_conf:.0%})")
     print(f"  Sim window: {sim_start_dt.date()} → today · Universe: {len(UNIVERSE)} symbols")
     print(f"{'='*82}\n")
 
