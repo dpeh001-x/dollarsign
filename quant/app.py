@@ -31,10 +31,56 @@ import strategies
 import ml
 import class_xgb
 import options
+import reddit_scanner
 
 st.set_page_config(page_title="Long or Short?", page_icon="$", layout="centered")
 
 st.title("Long or Short?")
+
+# ─── Reddit ticker scanner ───
+with st.expander("Trending on Reddit", expanded=False):
+    st.caption("Scan finance subs (wallstreetbets, stocks, investing, options, etc.) for ticker mentions + sentiment. Ranked by composite score.")
+
+    @st.cache_data(show_spinner=False, ttl=300)  # 5 min cache
+    def cached_reddit_scan(posts_per_sub: int, hours: float, _ts: int) -> list[dict]:
+        results = reddit_scanner.scan(posts_per_sub=posts_per_sub, max_age_hours=hours)
+        return [{"ticker": r.ticker, "mentions": r.mentions, "sentiment": r.sentiment_avg,
+                 "score": r.score, "subs": " ".join(r.subs[:3]),
+                 "sample": r.sample_post, "url": r.sample_url} for r in results]
+
+    rcols = st.columns([1, 1, 2])
+    posts_per_sub = rcols[0].number_input("Posts/sub", min_value=10, max_value=100, value=40, step=10)
+    hours = rcols[1].number_input("Hours back", min_value=6, max_value=168, value=48, step=6)
+    if rcols[2].button("Scan Reddit now", use_container_width=True):
+        if not reddit_scanner._is_configured():
+            st.error("Reddit API not configured. Add `REDDIT_CLIENT_ID` and `REDDIT_CLIENT_SECRET` "
+                     "to Streamlit Cloud secrets (Settings → Secrets), or your local `.env`. "
+                     "Get a key at reddit.com/prefs/apps (type: script).")
+        else:
+            with st.spinner("Scanning Reddit..."):
+                try:
+                    import time as _t
+                    rows = cached_reddit_scan(int(posts_per_sub), float(hours), int(_t.time() // 300))
+                    if not rows:
+                        st.info("No ticker mentions found in scanned window.")
+                    else:
+                        df_red = pd.DataFrame(rows[:25])
+                        st.dataframe(
+                            df_red[["ticker", "mentions", "sentiment", "score", "subs", "sample"]],
+                            use_container_width=True, hide_index=True,
+                            column_config={
+                                "ticker": st.column_config.TextColumn("Ticker", width="small"),
+                                "mentions": st.column_config.NumberColumn("Mentions", width="small"),
+                                "sentiment": st.column_config.NumberColumn("Sentiment", format="%+.2f", width="small"),
+                                "score": st.column_config.NumberColumn("Score", format="%.2f", width="small"),
+                                "subs": st.column_config.TextColumn("Subs", width="medium"),
+                                "sample": st.column_config.TextColumn("Top post", width="large"),
+                            },
+                        )
+                        top3 = ", ".join(r["ticker"] for r in rows[:3])
+                        st.caption(f"Try one in the Symbol box below. Top 3: **{top3}**")
+                except Exception as e:
+                    st.error(f"Scan failed: {e}")
 
 col_sym, col_speed = st.columns([3, 2])
 with col_sym:
