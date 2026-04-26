@@ -98,6 +98,25 @@ with col_speed:
     )
 use_ensemble = model_speed.startswith("Best")
 
+# Minimum confidence to actually act on a signal. Below this, override to FLAT.
+# 0.15 conf == |P(up) - 0.5| > 0.075, so effective long/short thresholds become
+# P(up) > 0.575 / < 0.425. Filters out the noise zone where the model is barely
+# leaning one way.
+MIN_CONFIDENCE = 0.15
+
+
+def apply_confidence_filter(sig: dict, threshold: float = MIN_CONFIDENCE) -> dict:
+    """Override signal to 'flat' if confidence below threshold. Records original."""
+    if not sig or "confidence" not in sig:
+        return sig
+    if sig["confidence"] < threshold and sig.get("signal") != "flat":
+        out = dict(sig)
+        out["signal_raw"] = sig["signal"]
+        out["signal"] = "flat"
+        out["filtered"] = True
+        return out
+    return sig
+
 if not st.button("Get recommendation", type="primary", use_container_width=True):
     st.stop()
 
@@ -177,6 +196,23 @@ def cached_per_symbol_walkforward(sym: str, _df_hash: int, ensemble_flag: bool) 
         return None
 
 
+# ─── Multi-horizon prediction helpers ───
+@st.cache_data(show_spinner=False)
+def cached_pooled_today_horizon(class_name: str, start_iso: str, ensemble_flag: bool, horizon: int) -> dict:
+    if ensemble_flag:
+        return class_xgb.predict_today_for_class_ensemble(class_name, start_iso, horizon=horizon)
+    return class_xgb.predict_today_for_class(class_name, start_iso, horizon=horizon)
+
+
+@st.cache_data(show_spinner=False)
+def cached_per_symbol_today_horizon(sym: str, _df_hash: int, ensemble_flag: bool, horizon: int) -> dict:
+    if ensemble_flag:
+        predictor = ml.EnsemblePredictor(horizon=horizon).fit(df)
+    else:
+        predictor = ml.XGBPredictor(horizon=horizon).fit(df)
+    return predictor.predict_now(df)
+
+
 # ─── Today's signal (pooled if class benefits, else per-symbol) ───
 model_label = ""
 ensemble_suffix = " · 5-model ensemble" if use_ensemble else " · XGBoost"
@@ -224,6 +260,8 @@ if not use_pooled:
             st.error(f"ML training failed: {e}")
             st.stop()
 
+# Apply confidence filter — overrides to FLAT when conf < 15%.
+xgb_sig = apply_confidence_filter(xgb_sig)
 xgb_call = {"long": 1, "short": -1, "flat": 0}[xgb_sig["signal"]]
 
 # ─── Rule-based strategies (secondary context) ───
@@ -287,6 +325,11 @@ st.markdown(
 action_label = {1: "BUY LONG", -1: "SELL SHORT", 0: "STAY FLAT"}[recommendation_call]
 action_color = {1: "#00E68A", -1: "#FF4757", 0: "#FF9F43"}[recommendation_call]
 
+filtered_note = ""
+if xgb_sig.get("filtered"):
+    raw_sig = xgb_sig.get("signal_raw", "?").upper()
+    filtered_note = f"<div style='font-size:10px; color:#FFD93D; margin-top:4px;'>filtered: model leaned {raw_sig} but conf {xgb_sig['confidence']:.0%} below 15% threshold</div>"
+
 st.markdown(
     f"""
     <div style="background:{action_color}22; border:2px solid {action_color};
@@ -296,6 +339,7 @@ st.markdown(
         <div style="font-size:13px; color:#aaa;">
             P(up) <b>{xgb_sig['proba']:.1%}</b> · conf <b>{xgb_sig['confidence']:.0%}</b>
         </div>
+        {filtered_note}
         <div style="font-size:10px; color:#666; margin-top:6px;">{model_label}</div>
     </div>
     """,
@@ -334,6 +378,62 @@ if recommendation_call != 0:
             """,
             unsafe_allow_html=True,
         )
+
+# ─── Longer-horizon predictions (30d + 60d) ───
+st.subheader("Longer horizons")
+horizon_sigs: dict[int, dict | None] = {}
+for h in (30, 60):
+    try:
+        if use_pooled:
+            with st.spinner(f"Training {h}-day model..."):
+                pool_h = cached_pooled_today_horizon(sym_class, start_date_iso, use_ensemble, h)
+                raw = pool_h.get(symbol)
+        else:
+            with st.spinner(f"Training {h}-day model..."):
+                raw = cached_per_symbol_today_horizon(symbol, len(df), use_ensemble, h)
+        horizon_sigs[h] = apply_confidence_filter(raw) if raw else None
+    except Exception as e:
+        horizon_sigs[h] = {"error": str(e)}
+
+hcols = st.columns(2)
+for col, h in zip(hcols, (30, 60)):
+    sig = horizon_sigs.get(h)
+    if sig is None or "error" in (sig or {}):
+        err = (sig or {}).get("error", "no result")
+        col.markdown(
+            f"""
+            <div style="background:#1A1B24; border:1px solid #2A2B38; border-radius:8px; padding:14px;">
+                <div style="font-size:11px; color:#888; letter-spacing:1px;">{h}-DAY PREDICTION</div>
+                <div style="font-size:13px; color:#FF9F43; margin-top:8px;">unavailable</div>
+                <div style="font-size:10px; color:#666; margin-top:4px;">{err[:80]}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        continue
+    h_call = {"long": 1, "short": -1, "flat": 0}[sig["signal"]]
+    h_label = {1: "BUY LONG", -1: "SELL SHORT", 0: "STAY FLAT"}[h_call]
+    h_color = {1: "#00E68A", -1: "#FF4757", 0: "#FF9F43"}[h_call]
+    h_filtered = ""
+    if sig.get("filtered"):
+        raw_dir = sig.get("signal_raw", "?").upper()
+        h_filtered = f"<div style='font-size:10px; color:#FFD93D; margin-top:4px;'>filtered: leaned {raw_dir}, conf below 15%</div>"
+    col.markdown(
+        f"""
+        <div style="background:{h_color}22; border:1px solid {h_color};
+                    border-radius:8px; padding:14px; text-align:center;">
+            <div style="font-size:11px; color:#888; letter-spacing:1px;">{h}-DAY PREDICTION</div>
+            <div style="font-size:24px; font-weight:600; color:{h_color}; margin:6px 0;">{h_label}</div>
+            <div style="font-size:12px; color:#aaa;">
+                P(up) <b>{sig['proba']:.1%}</b> &nbsp;·&nbsp; conf <b>{sig['confidence']:.0%}</b>
+            </div>
+            {h_filtered}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+st.caption("Signals require ≥15% confidence to act on (otherwise FLAT). 30/60-day use the same model architecture but weren't separately tuned/backtested — 10-day is the primary signal.")
 
 # ─── Per-strategy votes ───
 st.subheader("Strategy votes")
