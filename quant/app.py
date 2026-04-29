@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pandas as pd
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from data import sources
 from data import live as live_quote_mod
@@ -37,7 +38,7 @@ import social_scanner
 st.set_page_config(page_title="Long or Short?", page_icon="$", layout="centered")
 
 st.title("Long or Short?")
-st.caption("XGBoost predicts next-10-day direction · Hold up to 30 days · Stop at 2.5×ATR · Min 15% confidence to enter")
+st.caption("XGBoost predicts next-10-day direction · Hold up to 30 days · Stop at 2.5×ATR · ONLY recommends when confidence > 75% (most queries return FLAT — by design)")
 
 with st.expander("How this strategy works", expanded=False):
     st.markdown(
@@ -47,10 +48,17 @@ with st.expander("How this strategy works", expanded=False):
 - Class-pooled training when symbol is equity / broad-ETF / crypto (more data, better generalization)
 - Tuned hyperparameters: horizon=10, max_depth=3, n_estimators=100 (selected by FDR-corrected grid search)
 
-**When to act**
-- **BUY LONG** if P(up) > **0.575** (15%+ confidence above coin-flip)
-- **SELL SHORT** if P(up) < **0.425**
-- **STAY FLAT** otherwise — anything in 0.425–0.575 is noise, model isn't sure
+**When to act (current threshold: 75% confidence)**
+- **BUY LONG** if P(up) > **0.875**
+- **SELL SHORT** if P(up) < **0.125**
+- **STAY FLAT** otherwise — almost everything at this threshold
+
+⚠ **Important nuance.** "Confidence" here = `|P(up) − 0.5| × 2`. It's distance
+from coin-flip, NOT a calibrated probability of being right. At 75% confidence
+(P(up) > 0.875), backtests show empirical win rate of ~60-65%, not 75%. The
+75% filter mainly serves to *only fire on the strongest possible signals* —
+expect to see FLAT on most queries. If you want more recommendations,
+lower MIN_CONFIDENCE in app.py.
 
 **How to size the trade**
 - Stop loss: **2.5× ATR(14)** against you (volatility-adjusted, tighter for SPY, wider for crypto)
@@ -134,16 +142,17 @@ with col_speed:
     )
 use_ensemble = model_speed.startswith("Best")
 
-# Cache lifetime for data + model predictions. New OHLC bars only appear after
-# market close, so 6h refresh catches today's close, retrains models, and
-# refreshes all derived metrics. Live spot quote refreshes separately at 30s.
-CACHE_TTL_SECONDS = 6 * 3600  # 6 hours
+# Cache lifetime for data + model predictions. After this, fresh OHLC fetched,
+# models retrained. Live spot quote refreshes separately at 30s.
+CACHE_TTL_SECONDS = 2 * 3600  # 2 hours
+AUTO_REFRESH_MS = CACHE_TTL_SECONDS * 1000  # full page rerun cadence
 
-# Minimum confidence to actually act on a signal. Below this, override to FLAT.
-# 0.15 conf == |P(up) - 0.5| > 0.075, so effective long/short thresholds become
-# P(up) > 0.575 / < 0.425. Filters out the noise zone where the model is barely
-# leaning one way.
-MIN_CONFIDENCE = 0.15
+# Minimum confidence to recommend a trade. 0.75 confidence == |P(up) - 0.5| > 0.375,
+# so effective long/short thresholds are P(up) > 0.875 or < 0.125. Very high bar —
+# most signals will resolve to FLAT. Honest note: model "confidence" is distance
+# from coin-flip, NOT calibrated probability of being right. Empirical win rate
+# at these extreme probabilities is ~60-65% from backtests, not 75%.
+MIN_CONFIDENCE = 0.75
 
 
 def apply_confidence_filter(sig: dict, threshold: float = MIN_CONFIDENCE) -> dict:
@@ -158,12 +167,31 @@ def apply_confidence_filter(sig: dict, threshold: float = MIN_CONFIDENCE) -> dic
         return out
     return sig
 
-if not st.button("Get recommendation", type="primary", use_container_width=True):
+clicked = st.button("Get recommendation", type="primary", use_container_width=True)
+
+# Persist the user's request across auto-refresh re-runs. After 2h, page rerun
+# fires WITHOUT a button click — but if the same symbol+model are still active,
+# we re-render with the fresh cache instead of dropping back to the empty form.
+if clicked:
+    st.session_state["active_symbol"] = symbol
+    st.session_state["active_use_ensemble"] = use_ensemble
+
+active_symbol = st.session_state.get("active_symbol")
+active_use_ensemble = st.session_state.get("active_use_ensemble")
+should_render = clicked or (
+    active_symbol == symbol and active_use_ensemble == use_ensemble
+)
+
+if not should_render:
     st.stop()
 
 if not symbol:
     st.error("Enter a stock symbol.")
     st.stop()
+
+# Once we're rendering an active analysis, schedule auto-refresh so the page
+# re-runs and picks up the freshly-expired caches.
+st_autorefresh(interval=AUTO_REFRESH_MS, key="auto_refresh_2h")
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
@@ -511,7 +539,7 @@ for col, h in zip(hcols, (30, 60)):
         unsafe_allow_html=True,
     )
 
-st.caption("Signals require ≥15% confidence to act on (otherwise FLAT). 30/60-day use the same model architecture but weren't separately tuned/backtested — 10-day is the primary signal.")
+st.caption("Signals require ≥75% confidence to act on (P(up) > 0.875 or < 0.125). At this threshold, FLAT is the most common outcome. 30/60-day use the same model architecture but weren't separately tuned/backtested — 10-day is the primary signal.")
 
 # ─── Per-strategy votes ───
 st.subheader("Strategy votes")
@@ -671,5 +699,5 @@ with st.expander("Feature importance"):
         st.bar_chart(imp_df.set_index("Feature"), horizontal=True)
 
 st.caption(
-    f"daily bars · 10d horizon · {src_name} · model + data refresh every 6h · live spot every 30s · not financial advice"
+    f"daily bars · 10d horizon · {src_name} · auto-refreshes every 2h · live spot every 30s · not financial advice"
 )
