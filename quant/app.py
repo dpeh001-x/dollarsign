@@ -34,6 +34,7 @@ import ml
 import class_xgb
 import options
 import social_scanner
+import screener
 
 st.set_page_config(page_title="Long or Short?", page_icon="$", layout="centered")
 
@@ -126,6 +127,79 @@ with st.expander("Trending tickers", expanded=False):
                     st.caption(f"Drop one into the Symbol box below. Top 3: **{top3}**")
             except Exception as e:
                 st.error(f"Scan failed: {e}")
+
+# ─── Stock screener (find actionable signals across the universe) ───
+with st.expander("Stock screener — find high-conviction signals", expanded=False):
+    st.caption(f"Scans 25 liquid symbols (mega-caps + ETFs + crypto). Surfaces only those meeting the confidence threshold (currently {0.75:.0%}). Most days: 0 hits — by design.")
+
+    @st.cache_data(show_spinner=False, ttl=2 * 3600)
+    def cached_screen(ensemble_flag: bool, _bucket: int) -> list[dict]:
+        rows = screener.screen(use_ensemble=ensemble_flag)
+        return [{
+            "ticker": r.ticker, "class": r.asset_class,
+            "signal": r.signal, "proba": r.proba,
+            "confidence": r.confidence, "last_close": r.last_close,
+        } for r in rows]
+
+    sc_col1, sc_col2 = st.columns([3, 1])
+    sc_col1.write("**Click to scan** — first run trains models for ~25 symbols (~30-90s); cached for 2h afterward.")
+    if sc_col2.button("Run screen", use_container_width=True, key="run_screen"):
+        st.session_state["screen_run"] = True
+
+    if st.session_state.get("screen_run"):
+        with st.spinner("Scanning 25 symbols..."):
+            try:
+                import time as _t
+                screen_rows = cached_screen(use_ensemble, int(_t.time() // (2 * 3600)))
+            except Exception as e:
+                st.error(f"Screen failed: {e}")
+                screen_rows = []
+
+        if screen_rows:
+            actionable = [r for r in screen_rows
+                          if r["confidence"] >= 0.75 and r["signal"] != "flat"]
+
+            if actionable:
+                st.markdown(f"### Actionable signals ({len(actionable)})")
+                df_act = pd.DataFrame([{
+                    "Ticker": r["ticker"],
+                    "Signal": r["signal"].upper(),
+                    "P(up)": r["proba"],
+                    "Conf": r["confidence"],
+                    "Price": r["last_close"],
+                    "Class": r["class"],
+                } for r in actionable])
+                st.dataframe(
+                    df_act, use_container_width=True, hide_index=True,
+                    column_config={
+                        "P(up)": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Conf": st.column_config.NumberColumn(format="%.0f%%"),
+                        "Price": st.column_config.NumberColumn(format="$%.2f"),
+                    },
+                )
+                top_tickers = ", ".join(r["ticker"] for r in actionable[:5])
+                st.caption(f"Drop one into the Symbol input below for full analysis. Top: **{top_tickers}**")
+            else:
+                st.info("No symbol hit the 75% confidence threshold. The model is leaning weakly across all 25. Either wait for stronger market signals, or lower MIN_CONFIDENCE in app.py to see all leans.")
+
+            with st.expander(f"All {len(screen_rows)} results (sorted by confidence)"):
+                df_all = pd.DataFrame([{
+                    "Ticker": r["ticker"],
+                    "Class": r["class"],
+                    "Lean": r["signal"].upper(),
+                    "P(up)": r["proba"],
+                    "Conf": r["confidence"],
+                    "Price": r["last_close"],
+                    "Actionable": "yes" if (r["confidence"] >= 0.75 and r["signal"] != "flat") else "—",
+                } for r in screen_rows])
+                st.dataframe(
+                    df_all, use_container_width=True, hide_index=True,
+                    column_config={
+                        "P(up)": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Conf": st.column_config.NumberColumn(format="%.0f%%"),
+                        "Price": st.column_config.NumberColumn(format="$%.2f"),
+                    },
+                )
 
 col_sym, col_speed = st.columns([3, 2])
 with col_sym:
