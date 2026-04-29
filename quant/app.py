@@ -134,6 +134,11 @@ with col_speed:
     )
 use_ensemble = model_speed.startswith("Best")
 
+# Cache lifetime for data + model predictions. New OHLC bars only appear after
+# market close, so 6h refresh catches today's close, retrains models, and
+# refreshes all derived metrics. Live spot quote refreshes separately at 30s.
+CACHE_TTL_SECONDS = 6 * 3600  # 6 hours
+
 # Minimum confidence to actually act on a signal. Below this, override to FLAT.
 # 0.15 conf == |P(up) - 0.5| > 0.075, so effective long/short thresholds become
 # P(up) > 0.575 / < 0.425. Filters out the noise zone where the model is barely
@@ -161,7 +166,7 @@ if not symbol:
     st.stop()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
 def load(sym: str) -> pd.DataFrame:
     start = (date.today() - timedelta(days=3 * 365)).isoformat()
     df = sources.get_bars(sym, start, use_cache=True)
@@ -190,14 +195,14 @@ start_date_iso = (date.today() - timedelta(days=3 * 365)).isoformat()
 # ─── Cached model functions ───
 # Cache key includes `ensemble_flag` so toggling the radio invalidates correctly.
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
 def cached_pooled_today(class_name: str, start_iso: str, ensemble_flag: bool) -> dict:
     if ensemble_flag:
         return class_xgb.predict_today_for_class_ensemble(class_name, start_iso)
     return class_xgb.predict_today_for_class(class_name, start_iso)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
 def cached_pooled_walkforward(class_name: str, start_iso: str, ensemble_flag: bool) -> dict:
     if ensemble_flag:
         return class_xgb.predict_class_ensemble(
@@ -208,7 +213,7 @@ def cached_pooled_walkforward(class_name: str, start_iso: str, ensemble_flag: bo
     )
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
 def cached_per_symbol_today(sym: str, _df_hash: int, ensemble_flag: bool) -> dict:
     if ensemble_flag:
         predictor = ml.EnsemblePredictor().fit(df)
@@ -219,7 +224,7 @@ def cached_per_symbol_today(sym: str, _df_hash: int, ensemble_flag: bool) -> dic
     return sig
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
 def cached_per_symbol_walkforward(sym: str, _df_hash: int, ensemble_flag: bool) -> dict | None:
     try:
         if ensemble_flag:
@@ -233,14 +238,14 @@ def cached_per_symbol_walkforward(sym: str, _df_hash: int, ensemble_flag: bool) 
 
 
 # ─── Multi-horizon prediction helpers ───
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
 def cached_pooled_today_horizon(class_name: str, start_iso: str, ensemble_flag: bool, horizon: int) -> dict:
     if ensemble_flag:
         return class_xgb.predict_today_for_class_ensemble(class_name, start_iso, horizon=horizon)
     return class_xgb.predict_today_for_class(class_name, start_iso, horizon=horizon)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
 def cached_per_symbol_today_horizon(sym: str, _df_hash: int, ensemble_flag: bool, horizon: int) -> dict:
     if ensemble_flag:
         predictor = ml.EnsemblePredictor(horizon=horizon).fit(df)
@@ -544,7 +549,7 @@ ctx[3].metric("ADX", f"{current_adx:.0f}", "trending" if current_adx > 25 else "
 # ─── Options ───
 st.subheader("Options play")
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
 def cached_options_suggest(sym: str, _hash: int, signal: str, conf: float, spot: float, hist_vol: float) -> dict:
     return options.suggest_strategy(
         symbol=sym, spot=spot, signal=signal, confidence=conf,
@@ -665,4 +670,6 @@ with st.expander("Feature importance"):
         imp_df = pd.DataFrame([{"Feature": k, "Importance": v} for k, v in importance.items()])
         st.bar_chart(imp_df.set_index("Feature"), horizontal=True)
 
-st.caption(f"daily bars · 10d horizon · {src_name} · not financial advice")
+st.caption(
+    f"daily bars · 10d horizon · {src_name} · model + data refresh every 6h · live spot every 30s · not financial advice"
+)
