@@ -41,6 +41,17 @@ st.set_page_config(page_title="Long or Short?", page_icon="$", layout="centered"
 st.title("Long or Short?")
 st.caption("XGBoost predicts next-10-day direction · Hold up to 30 days · Stop at 2.5×ATR · ONLY recommends when confidence > 75% (most queries return FLAT — by design)")
 
+# Model-speed selection lives at the top so it applies to BOTH the screener
+# (which scans 25 symbols) and the per-symbol analysis below.
+model_speed = st.radio(
+    "Model",
+    options=["Fast (XGB)", "Best (5-model ensemble)"],
+    index=1,
+    help="Fast: 1 model, ~2s. Best: avg of 5 models, ~10s, +0.07 Sharpe.",
+    horizontal=True,
+)
+use_ensemble = model_speed.startswith("Best")
+
 with st.expander("How this strategy works", expanded=False):
     st.markdown(
         """
@@ -201,20 +212,10 @@ with st.expander("Stock screener — find high-conviction signals", expanded=Fal
                     },
                 )
 
-col_sym, col_speed = st.columns([3, 2])
-with col_sym:
-    symbol = st.text_input(
-        "Symbol", value="SPY",
-        help="e.g. AAPL, SPY, QQQ, BTC-USD",
-    ).upper().strip()
-with col_speed:
-    model_speed = st.radio(
-        "Model",
-        options=["Fast (XGB)", "Best (5-model ensemble)"],
-        index=1,
-        help="Fast: 1 model, ~2s. Best: avg of 5 models, ~10s, +0.07 Sharpe.",
-    )
-use_ensemble = model_speed.startswith("Best")
+symbol = st.text_input(
+    "Symbol", value="SPY",
+    help="e.g. AAPL, SPY, QQQ, BTC-USD",
+).upper().strip()
 
 # Cache lifetime for data + model predictions. After this, fresh OHLC fetched,
 # models retrained. Live spot quote refreshes separately at 30s.
