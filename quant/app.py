@@ -141,7 +141,7 @@ with st.expander("Trending tickers", expanded=False):
 
 # ─── Stock screener (find actionable signals across the universe) ───
 with st.expander("Stock screener — find high-conviction signals", expanded=False):
-    st.caption(f"Scans 25 liquid symbols (mega-caps + ETFs + crypto). Surfaces only those meeting the confidence threshold (currently {0.75:.0%}). Most days: 0 hits — by design.")
+    st.caption(f"Scans {screener.SCREEN_UNIVERSE_SIZE} symbols across mega-caps, broad ETFs, sector ETFs, industry ETFs, macro/commodity ETFs, international ETFs, and crypto. Surfaces only those meeting the confidence threshold (currently {0.75:.0%}).")
 
     @st.cache_data(show_spinner=False, ttl=2 * 3600)
     def cached_screen(ensemble_flag: bool, _bucket: int) -> list[dict]:
@@ -153,7 +153,7 @@ with st.expander("Stock screener — find high-conviction signals", expanded=Fal
         } for r in rows]
 
     sc_col1, sc_col2 = st.columns([3, 1])
-    sc_col1.write("**Click to scan** — first run trains models for ~25 symbols (~30-90s); cached for 2h afterward.")
+    sc_col1.write(f"**Click to scan** {screener.SCREEN_UNIVERSE_SIZE} symbols — first run takes ~5-10 min (ensemble) or ~2 min (Fast mode); cached for 2h afterward.")
     if sc_col2.button("Run screen", use_container_width=True, key="run_screen"):
         st.session_state["screen_run"] = True
 
