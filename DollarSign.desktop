@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Long or Short?
+Comment=XGBoost stock direction predictor
+Exec=/home/user/dollarsign/start.sh
+Icon=utilities-terminal
+Terminal=true
+Categories=Finance;Science;
+StartupNotify=true
