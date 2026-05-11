@@ -30,6 +30,7 @@ import ml
 import indicators
 import regime
 from data import sources
+from data import macro as macro_src
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,7 @@ def prepare_symbol(symbol: str, start: str) -> pd.DataFrame:
 def build_pooled_features(
     symbol_dfs: dict[str, pd.DataFrame],
     horizon: int = 10,
+    macro_df: "pd.DataFrame | None" = None,
 ) -> pd.DataFrame:
     """Stack per-symbol features. Each row carries date, symbol, forward_date, features, target.
 
@@ -70,7 +72,7 @@ def build_pooled_features(
     """
     rows: list[pd.DataFrame] = []
     for sym, df in symbol_dfs.items():
-        feats = ml.make_features(df, horizon=horizon).copy()
+        feats = ml.make_features(df, horizon=horizon, macro_df=macro_df).copy()
         feats["symbol"] = sym
         feats["date"] = feats.index
         # forward_date: the date the target's close is taken from
@@ -167,7 +169,15 @@ def predict_class(
     if not symbol_dfs:
         return {}
 
-    pooled = build_pooled_features(symbol_dfs, horizon=horizon)
+    try:
+        from datetime import datetime, timezone
+        end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        macro_df = macro_src.get_vix(start, end)
+    except Exception as e:
+        logger.warning("VIX fetch failed, continuing without macro features: %s", e)
+        macro_df = None
+
+    pooled = build_pooled_features(symbol_dfs, horizon=horizon, macro_df=macro_df)
     return walkforward_pool(pooled, train_size_dates=train_size, step_size_dates=step_size)
 
 
@@ -208,7 +218,15 @@ def predict_today_for_class_ensemble(
     if not symbol_dfs:
         return {}
 
-    pooled = build_pooled_features(symbol_dfs, horizon=horizon)
+    try:
+        from datetime import datetime, timezone
+        end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        macro_df = macro_src.get_vix(start, end)
+    except Exception as e:
+        logger.warning("VIX fetch failed, continuing without macro features: %s", e)
+        macro_df = None
+
+    pooled = build_pooled_features(symbol_dfs, horizon=horizon, macro_df=macro_df)
     feat_cols = list(ml.FEATURE_COLS)
     train = pooled.dropna(subset=["target"]).dropna(subset=feat_cols)
     if len(train) < 200:
@@ -297,7 +315,15 @@ def predict_class_ensemble(
     if not symbol_dfs:
         return {}
 
-    pooled = build_pooled_features(symbol_dfs, horizon=horizon).copy()
+    try:
+        from datetime import datetime, timezone
+        end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        macro_df = macro_src.get_vix(start, end)
+    except Exception as e:
+        logger.warning("VIX fetch failed, continuing without macro features: %s", e)
+        macro_df = None
+
+    pooled = build_pooled_features(symbol_dfs, horizon=horizon, macro_df=macro_df).copy()
     pooled["date"] = pd.to_datetime(pooled["date"], utc=True)
     pooled["forward_date"] = pd.to_datetime(pooled["forward_date"], utc=True)
 

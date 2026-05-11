@@ -33,6 +33,7 @@ import ml
 import class_xgb
 import options
 import social_scanner
+from data import macro as macro_src
 
 st.set_page_config(page_title="Long or Short?", page_icon="$", layout="centered")
 
@@ -128,11 +129,12 @@ with col_sym:
 with col_speed:
     model_speed = st.radio(
         "Model",
-        options=["Fast (XGB)", "Best (5-model ensemble)"],
+        options=["Fast (XGB)", "Best (5-model ensemble)", "Stacking (meta-learner)"],
         index=1,
-        help="Fast: 1 model, ~2s. Best: avg of 5 models, ~10s, +0.07 Sharpe.",
+        help="Fast: 1 model, ~2s. Best: avg of 5 models, ~10s. Stacking: meta-learner on 5 models, ~15s.",
     )
-use_ensemble = model_speed.startswith("Best")
+use_ensemble = model_speed.startswith("Best") or model_speed.startswith("Stacking")
+use_stacking = model_speed.startswith("Stacking")
 
 # Minimum confidence to actually act on a signal. Below this, override to FLAT.
 # 0.15 conf == |P(up) - 0.5| > 0.075, so effective long/short thresholds become
@@ -168,6 +170,15 @@ def load(sym: str) -> pd.DataFrame:
     df = indicators.attach_all(df)
     df = regime.label(df)
     return df
+
+
+@st.cache_data(show_spinner=False)
+def load_macro(start_iso: str) -> pd.DataFrame | None:
+    try:
+        end = date.today().isoformat()
+        return macro_src.get_vix(start_iso, end)
+    except Exception:
+        return None
 
 
 with st.spinner(f"Analyzing {symbol}..."):
@@ -209,22 +220,27 @@ def cached_pooled_walkforward(class_name: str, start_iso: str, ensemble_flag: bo
 
 
 @st.cache_data(show_spinner=False)
-def cached_per_symbol_today(sym: str, _df_hash: int, ensemble_flag: bool) -> dict:
+def cached_per_symbol_today(sym: str, _df_hash: int, ensemble_flag: bool, start_iso: str) -> dict:
+    macro_df = load_macro(start_iso)
     if ensemble_flag:
-        predictor = ml.EnsemblePredictor().fit(df)
+        predictor = ml.EnsemblePredictor().fit(df, macro_df=macro_df)
     else:
-        predictor = ml.XGBPredictor().fit(df)
-    sig = predictor.predict_now(df)
+        predictor = ml.XGBPredictor().fit(df, macro_df=macro_df)
+    sig = predictor.predict_now(df, macro_df=macro_df)
     sig["importance"] = predictor.feature_importance().head(8).to_dict()
     return sig
 
 
 @st.cache_data(show_spinner=False)
-def cached_per_symbol_walkforward(sym: str, _df_hash: int, ensemble_flag: bool) -> dict | None:
+def cached_per_symbol_walkforward(sym: str, _df_hash: int, ensemble_flag: bool, start_iso: str, stacking_flag: bool = False) -> dict | None:
     try:
-        if ensemble_flag:
+        macro_df = load_macro(start_iso)
+        if stacking_flag:
+            wf = ml.StackingWalkForward()
+            positions = wf.positions(df, macro_df=macro_df)
+        elif ensemble_flag:
             wf = ml.EnsembleWalkForward()
-            positions = wf.positions(df)
+            positions = wf.positions(df, macro_df=macro_df)
         else:
             positions = strategies.xgb_walk_forward(df)
         return backtest.run(df, positions, fee_bps=1.0, slippage_bps=1.0).metrics
@@ -241,12 +257,13 @@ def cached_pooled_today_horizon(class_name: str, start_iso: str, ensemble_flag: 
 
 
 @st.cache_data(show_spinner=False)
-def cached_per_symbol_today_horizon(sym: str, _df_hash: int, ensemble_flag: bool, horizon: int) -> dict:
+def cached_per_symbol_today_horizon(sym: str, _df_hash: int, ensemble_flag: bool, horizon: int, start_iso: str) -> dict:
+    macro_df = load_macro(start_iso)
     if ensemble_flag:
-        predictor = ml.EnsemblePredictor(horizon=horizon).fit(df)
+        predictor = ml.EnsemblePredictor(horizon=horizon).fit(df, macro_df=macro_df)
     else:
-        predictor = ml.XGBPredictor(horizon=horizon).fit(df)
-    return predictor.predict_now(df)
+        predictor = ml.XGBPredictor(horizon=horizon).fit(df, macro_df=macro_df)
+    return predictor.predict_now(df, macro_df=macro_df)
 
 
 # ─── Today's signal (pooled if class benefits, else per-symbol) ───
@@ -285,7 +302,7 @@ if not use_pooled:
     )
     with st.spinner(msg):
         try:
-            xgb_sig = cached_per_symbol_today(symbol, len(df), use_ensemble)
+            xgb_sig = cached_per_symbol_today(symbol, len(df), use_ensemble, start_date_iso)
             base = (
                 "per-symbol (no asset-class match)"
                 if sym_class is None
@@ -332,9 +349,9 @@ if use_pooled:
         except Exception:
             xgb_metrics = None
 else:
-    kind = "5-model ensemble" if use_ensemble else "XGBoost"
+    kind = "Stacking" if use_stacking else ("5-model ensemble" if use_ensemble else "XGBoost")
     with st.spinner(f"Walk-forward backtesting per-symbol {kind}..."):
-        xgb_metrics = cached_per_symbol_walkforward(symbol, len(df), use_ensemble)
+        xgb_metrics = cached_per_symbol_walkforward(symbol, len(df), use_ensemble, start_date_iso, stacking_flag=use_stacking)
 
 # XGB sole signal — rule votes are display-only.
 recommendation_call = xgb_call
@@ -463,7 +480,7 @@ for h in (30, 60):
                 raw = pool_h.get(symbol)
         else:
             with st.spinner(f"Training {h}-day model..."):
-                raw = cached_per_symbol_today_horizon(symbol, len(df), use_ensemble, h)
+                raw = cached_per_symbol_today_horizon(symbol, len(df), use_ensemble, h, start_date_iso)
         horizon_sigs[h] = apply_confidence_filter(raw) if raw else None
     except Exception as e:
         horizon_sigs[h] = {"error": str(e)}
