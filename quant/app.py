@@ -35,11 +35,41 @@ import class_xgb
 import options
 import social_scanner
 import screener
+import trend_momentum
+import trending_advisor
+import signals as signals_mod
 
 st.set_page_config(page_title="Long or Short?", page_icon="$", layout="centered")
 
 st.title("Long or Short?")
-st.caption("XGBoost predicts next-10-day direction · Hold up to 30 days · Stop at 2.5×ATR · ONLY recommends when confidence > 75% (most queries return FLAT — by design)")
+st.caption("XGBoost predicts next-10-day direction · 7-tier signal (STRONG_SHORT → STRONG_LONG) with technical confluence · Structural stops + conviction-scaled sizing")
+
+# ─── Risk / sizing settings (sidebar) ───
+with st.sidebar:
+    st.header("Trade settings")
+    st.caption("Used to size the suggested position. Stays in this browser session only.")
+    account_size = st.number_input(
+        "Account size ($)", min_value=100.0, max_value=10_000_000.0,
+        value=float(st.session_state.get("account_size", 10000.0)),
+        step=500.0, format="%.0f",
+        help="Total trading capital. Position values + risk are computed against this.",
+    )
+    base_risk_pct = st.slider(
+        "Base risk per trade (%)",
+        min_value=0.25, max_value=3.0,
+        value=float(st.session_state.get("base_risk_pct", 1.0)),
+        step=0.25,
+        help="Risked on a 5★ conviction setup. Lower-conviction setups risk proportionally less.",
+    ) / 100.0
+    st.session_state["account_size"] = account_size
+    st.session_state["base_risk_pct"] = base_risk_pct * 100
+
+    st.caption(
+        f"5★ trade risks **${account_size * base_risk_pct:,.0f}** ({base_risk_pct*100:.2f}%). "
+        f"1★ risks **${account_size * base_risk_pct * 0.2:,.0f}** ({base_risk_pct*100*0.2:.2f}%)."
+    )
+    st.divider()
+    st.caption("Not financial advice. Past backtest performance does not guarantee future results.")
 
 # Model-speed selection lives at the top so it applies to BOTH the screener
 # (which scans 25 symbols) and the per-symbol analysis below.
@@ -95,15 +125,7 @@ lower MIN_CONFIDENCE in app.py.
 
 # ─── Trending tickers (apewisdom — Reddit + StockTwits + Twitter aggregator) ───
 with st.expander("Trending tickers", expanded=False):
-    st.caption("Live cross-platform scan via apewisdom.io (aggregates Reddit + StockTwits + Twitter). No auth needed. Ranked by mentions × 24h momentum.")
-
-    @st.cache_data(show_spinner=False, ttl=300)  # 5-min cache
-    def cached_social_scan(filter_name: str, _ts: int) -> list[dict]:
-        results = social_scanner.scan(limit=25, filter_name=filter_name)
-        return [{"ticker": r.ticker, "company": r.company_name,
-                 "mentions": r.mentions, "yesterday": r.mentions_24h_ago,
-                 "momentum": r.momentum, "rank_chg": r.rank_change,
-                 "score": r.score} for r in results]
+    st.caption("Live cross-platform scan via apewisdom.io (aggregates Reddit + StockTwits + Twitter). Each ticker is then scored on trend & momentum and given an objective BUY / ACCUMULATE / WATCH / AVOID / SHORT verdict with a thesis.")
 
     sc1, sc2 = st.columns([2, 2])
     filt = sc1.selectbox(
@@ -112,38 +134,108 @@ with st.expander("Trending tickers", expanded=False):
         index=0,
         help="all-stocks: combined feed. wallstreetbets/options/etc: source-specific. cryptos: BTC/ETH/etc.",
     )
+    @st.cache_data(show_spinner=False, ttl=300)
+    def cached_trending_advice(filter_name: str, _ts: int, max_advice: int = 15) -> list[dict]:
+        sigs = social_scanner.scan(limit=max(25, max_advice), filter_name=filter_name)
+        advised = trending_advisor.advise(sigs, max_advice=max_advice)
+        return [{
+            "ticker": a.ticker, "company": a.company_name,
+            "mentions": a.mentions, "yesterday": a.mentions_24h_ago,
+            "social_momentum": a.social_momentum, "social_score": a.social_score,
+            "last_close": a.last_close,
+            "trend_score": a.trend_score, "trend_label": a.trend_label,
+            "momentum_score": a.momentum_score, "momentum_label": a.momentum_label,
+            "rsi_14": a.rsi_14, "adx": a.adx,
+            "ret_5d": a.ret_5d, "ret_20d": a.ret_20d,
+            "verdict": a.verdict, "verdict_color": a.verdict_color,
+            "conviction": a.conviction, "thesis": a.thesis,
+        } for a in advised]
+
     if sc2.button("Scan now", use_container_width=True):
-        with st.spinner(f"Scanning apewisdom ({filt})..."):
+        with st.spinner(f"Scanning apewisdom + scoring top tickers ({filt})..."):
             try:
                 import time as _t
-                rows = cached_social_scan(filt, int(_t.time() // 300))
-                if not rows:
-                    st.info("No tickers returned.")
-                else:
-                    df_st = pd.DataFrame(rows)
-                    st.dataframe(
-                        df_st[["ticker", "company", "mentions", "yesterday", "momentum", "rank_chg", "score"]],
-                        use_container_width=True, hide_index=True,
-                        column_config={
-                            "ticker": st.column_config.TextColumn("Ticker", width="small"),
-                            "company": st.column_config.TextColumn("Company", width="medium"),
-                            "mentions": st.column_config.NumberColumn("Today", width="small", help="Mentions in last ~24h"),
-                            "yesterday": st.column_config.NumberColumn("24h ago", width="small"),
-                            "momentum": st.column_config.NumberColumn("Mom×", format="%.1fx", width="small", help="today / yesterday — >1.0 = heating up"),
-                            "rank_chg": st.column_config.NumberColumn("Rank Δ", format="%+d", width="small", help="Positive = climbed in popularity"),
-                            "score": st.column_config.NumberColumn("Score", format="%.1f", width="small"),
-                        },
-                    )
-                    top3 = ", ".join(r["ticker"] for r in rows[:3])
-                    st.caption(f"Drop one into the Symbol box below. Top 3: **{top3}**")
+                rows = cached_trending_advice(filt, int(_t.time() // 300))
             except Exception as e:
                 st.error(f"Scan failed: {e}")
+                rows = []
+
+        if rows:
+            # ─── Summary table with verdict column ───
+            df_st = pd.DataFrame([{
+                "Ticker": r["ticker"],
+                "Verdict": r["verdict"],
+                "Conv": "★" * r["conviction"],
+                "Trend": (r["trend_label"] or "—").replace("_", " "),
+                "Momentum": (r["momentum_label"] or "—").replace("_", " "),
+                "T score": r["trend_score"],
+                "M score": r["momentum_score"],
+                "RSI": r["rsi_14"],
+                "20d %": (r["ret_20d"] * 100) if r["ret_20d"] is not None else None,
+                "Social Mom×": r["social_momentum"],
+                "Mentions": r["mentions"],
+            } for r in rows])
+            st.dataframe(
+                df_st, use_container_width=True, hide_index=True,
+                column_config={
+                    "Verdict": st.column_config.TextColumn("Verdict", width="small"),
+                    "Conv": st.column_config.TextColumn("Conv", width="small", help="Conviction 1–5"),
+                    "T score": st.column_config.NumberColumn("Trend", format="%+.2f", help="−1..+1"),
+                    "M score": st.column_config.NumberColumn("Mom", format="%+.2f", help="−1..+1"),
+                    "RSI": st.column_config.NumberColumn(format="%.0f"),
+                    "20d %": st.column_config.NumberColumn(format="%+.1f%%"),
+                    "Social Mom×": st.column_config.NumberColumn(format="%.1fx", help="mentions today / yesterday"),
+                },
+            )
+
+            # ─── Verdict-coloured cards with thesis ───
+            st.markdown("##### Per-ticker thesis")
+            for r in rows:
+                price_str = f"${r['last_close']:.2f}" if r["last_close"] else "—"
+                co = r["company"] or ""
+                co_str = f" · <span style='color:#888'>{co}</span>" if co else ""
+                st.markdown(
+                    f"""
+                    <div style="background:{r['verdict_color']}15;
+                                border-left:4px solid {r['verdict_color']};
+                                border-radius:6px; padding:10px 14px; margin:6px 0;">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <div>
+                                <b style="font-size:15px; color:#fff;">{r['ticker']}</b>
+                                <span style="color:#aaa; margin-left:6px;">{price_str}</span>
+                                {co_str}
+                            </div>
+                            <div>
+                                <span style="background:{r['verdict_color']}; color:#0E1117;
+                                             padding:3px 10px; border-radius:4px;
+                                             font-weight:700; font-size:12px;">{r['verdict']}</span>
+                                <span style="color:{r['verdict_color']}; margin-left:8px; font-size:13px;">
+                                    {'★' * r['conviction']}<span style="color:#333">{'★' * (5 - r['conviction'])}</span>
+                                </span>
+                            </div>
+                        </div>
+                        <div style="margin-top:6px; font-size:12px; color:#ccc; line-height:1.5;">
+                            {r['thesis']}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            top_buys = [r["ticker"] for r in rows if r["verdict"] == "BUY"][:5]
+            if top_buys:
+                st.caption(f"Highest-conviction BUYs from trending: **{', '.join(top_buys)}** — drop one into the Symbol box below for the full ML analysis.")
+            else:
+                st.caption("No BUY verdicts in the current trending set. Drop any ticker into the Symbol box below for the full ML analysis anyway.")
+            st.caption("⚠ Verdicts are objective rule-based scoring, not financial advice. The crowd is often wrong; size positions accordingly.")
+        elif rows == []:
+            st.info("No tickers returned.")
 
 # ─── Stock screener (find actionable signals across the universe) ───
 with st.expander("Stock screener — find high-conviction signals", expanded=False):
     st.caption(f"Scans {screener.SCREEN_UNIVERSE_SIZE} symbols across mega-caps, broad ETFs, sector ETFs, industry ETFs, macro/commodity ETFs, international ETFs, and crypto. Surfaces only those meeting the confidence threshold (currently {0.75:.0%}).")
 
-    @st.cache_data(show_spinner=False, ttl=2 * 3600)
+    @st.cache_data(show_spinner=False, ttl=15 * 60)
     def cached_screen(ensemble_flag: bool, _bucket: int) -> list[dict]:
         rows = screener.screen(use_ensemble=ensemble_flag)
         return [{
@@ -153,7 +245,7 @@ with st.expander("Stock screener — find high-conviction signals", expanded=Fal
         } for r in rows]
 
     sc_col1, sc_col2 = st.columns([3, 1])
-    sc_col1.write(f"**Click to scan** {screener.SCREEN_UNIVERSE_SIZE} symbols — first run takes ~5-10 min (ensemble) or ~2 min (Fast mode); cached for 2h afterward.")
+    sc_col1.write(f"**Click to scan** {screener.SCREEN_UNIVERSE_SIZE} symbols — first run takes ~5-10 min (ensemble) or ~2 min (Fast mode); cached for 15 min afterward.")
     if sc_col2.button("Run screen", use_container_width=True, key="run_screen"):
         st.session_state["screen_run"] = True
 
@@ -161,7 +253,7 @@ with st.expander("Stock screener — find high-conviction signals", expanded=Fal
         with st.spinner("Scanning 25 symbols..."):
             try:
                 import time as _t
-                screen_rows = cached_screen(use_ensemble, int(_t.time() // (2 * 3600)))
+                screen_rows = cached_screen(use_ensemble, int(_t.time() // (15 * 60)))
             except Exception as e:
                 st.error(f"Screen failed: {e}")
                 screen_rows = []
@@ -212,6 +304,108 @@ with st.expander("Stock screener — find high-conviction signals", expanded=Fal
                     },
                 )
 
+# ─── Trend & momentum tracker (pure indicators, no ML) ───
+with st.expander("Trend & momentum tracker", expanded=False):
+    st.caption(
+        f"Indicator-based scan of {screener.SCREEN_UNIVERSE_SIZE} symbols. "
+        "Trend = SMA50/SMA200 alignment + price vs SMA200 + ADX×DI direction. "
+        "Momentum = 20d/5d returns + RSI distance from 50 + MACD histogram. "
+        "**Aligned** rows have trend & momentum pointing the same way — strongest directional setups."
+    )
+
+    @st.cache_data(show_spinner=False, ttl=15 * 60)
+    def cached_trend_momentum(_bucket: int) -> list[dict]:
+        rows = trend_momentum.track()
+        return [{
+            "ticker": r.ticker, "class": r.asset_class,
+            "trend_score": r.trend_score, "trend_label": r.trend_label,
+            "momentum_score": r.momentum_score, "momentum_label": r.momentum_label,
+            "combined_score": r.combined_score, "aligned": r.aligned,
+            "adx": r.adx, "rsi_14": r.rsi_14,
+            "ret_5d": r.ret_5d, "ret_20d": r.ret_20d,
+            "last_close": r.last_close,
+        } for r in rows]
+
+    tm_col1, tm_col2 = st.columns([3, 1])
+    tm_col1.write(f"**Click to scan.** Uses cached OHLC data — typically <30s. Re-cached for 15 min.")
+    if tm_col2.button("Run tracker", use_container_width=True, key="run_tm"):
+        st.session_state["tm_run"] = True
+
+    if st.session_state.get("tm_run"):
+        with st.spinner(f"Scanning {screener.SCREEN_UNIVERSE_SIZE} symbols for trend + momentum..."):
+            try:
+                import time as _t
+                tm_rows = cached_trend_momentum(int(_t.time() // (15 * 60)))
+            except Exception as e:
+                st.error(f"Tracker failed: {e}")
+                tm_rows = []
+
+        if tm_rows:
+            aligned_rows = [r for r in tm_rows if r["aligned"]]
+
+            tab_aligned, tab_trend, tab_mom, tab_all = st.tabs([
+                f"Aligned setups ({len(aligned_rows)})",
+                "Strongest trends",
+                "Strongest momentum",
+                f"All {len(tm_rows)}",
+            ])
+
+            def _fmt_rows(rows: list[dict]) -> pd.DataFrame:
+                return pd.DataFrame([{
+                    "Ticker": r["ticker"],
+                    "Class": r["class"],
+                    "Trend": r["trend_label"].replace("_", " "),
+                    "Momentum": r["momentum_label"].replace("_", " "),
+                    "Trend score": r["trend_score"],
+                    "Mom score": r["momentum_score"],
+                    "Combined": r["combined_score"],
+                    "RSI": r["rsi_14"],
+                    "ADX": r["adx"],
+                    "5d %": r["ret_5d"] * 100,
+                    "20d %": r["ret_20d"] * 100,
+                    "Price": r["last_close"],
+                    "Aligned": "yes" if r["aligned"] else "—",
+                } for r in rows])
+
+            col_cfg = {
+                "Trend score": st.column_config.NumberColumn(format="%+.2f", help="-1..+1"),
+                "Mom score": st.column_config.NumberColumn(format="%+.2f", help="-1..+1"),
+                "Combined": st.column_config.NumberColumn(format="%+.2f", help="trend + momentum, -2..+2"),
+                "RSI": st.column_config.NumberColumn(format="%.0f"),
+                "ADX": st.column_config.NumberColumn(format="%.0f", help=">25 = trending"),
+                "5d %": st.column_config.NumberColumn(format="%+.1f%%"),
+                "20d %": st.column_config.NumberColumn(format="%+.1f%%"),
+                "Price": st.column_config.NumberColumn(format="$%.2f"),
+            }
+
+            with tab_aligned:
+                if aligned_rows:
+                    aligned_sorted = sorted(aligned_rows, key=lambda r: abs(r["combined_score"]), reverse=True)
+                    st.dataframe(_fmt_rows(aligned_sorted), use_container_width=True,
+                                 hide_index=True, column_config=col_cfg)
+                    top_up = [r["ticker"] for r in aligned_sorted if r["combined_score"] > 0][:5]
+                    top_dn = [r["ticker"] for r in aligned_sorted if r["combined_score"] < 0][:5]
+                    if top_up:
+                        st.caption(f"Strongest bull setups: **{', '.join(top_up)}**")
+                    if top_dn:
+                        st.caption(f"Strongest bear setups: **{', '.join(top_dn)}**")
+                else:
+                    st.info("No symbols with aligned trend + momentum. Market is mixed.")
+
+            with tab_trend:
+                trend_sorted = sorted(tm_rows, key=lambda r: abs(r["trend_score"]), reverse=True)[:25]
+                st.dataframe(_fmt_rows(trend_sorted), use_container_width=True,
+                             hide_index=True, column_config=col_cfg)
+
+            with tab_mom:
+                mom_sorted = sorted(tm_rows, key=lambda r: abs(r["momentum_score"]), reverse=True)[:25]
+                st.dataframe(_fmt_rows(mom_sorted), use_container_width=True,
+                             hide_index=True, column_config=col_cfg)
+
+            with tab_all:
+                st.dataframe(_fmt_rows(tm_rows), use_container_width=True,
+                             hide_index=True, column_config=col_cfg)
+
 symbol = st.text_input(
     "Symbol", value="SPY",
     help="e.g. AAPL, SPY, QQQ, BTC-USD",
@@ -219,7 +413,7 @@ symbol = st.text_input(
 
 # Cache lifetime for data + model predictions. After this, fresh OHLC fetched,
 # models retrained. Live spot quote refreshes separately at 30s.
-CACHE_TTL_SECONDS = 2 * 3600  # 2 hours
+CACHE_TTL_SECONDS = 15 * 60  # 15 minutes
 AUTO_REFRESH_MS = CACHE_TTL_SECONDS * 1000  # full page rerun cadence
 
 # Minimum confidence to recommend a trade. 0.75 confidence == |P(up) - 0.5| > 0.375,
@@ -244,7 +438,7 @@ def apply_confidence_filter(sig: dict, threshold: float = MIN_CONFIDENCE) -> dic
 
 clicked = st.button("Get recommendation", type="primary", use_container_width=True)
 
-# Persist the user's request across auto-refresh re-runs. After 2h, page rerun
+# Persist the user's request across auto-refresh re-runs. Every 15 min, page rerun
 # fires WITHOUT a button click — but if the same symbol+model are still active,
 # we re-render with the fresh cache instead of dropping back to the empty form.
 if clicked:
@@ -266,7 +460,7 @@ if not symbol:
 
 # Once we're rendering an active analysis, schedule auto-refresh so the page
 # re-runs and picks up the freshly-expired caches.
-st_autorefresh(interval=AUTO_REFRESH_MS, key="auto_refresh_2h")
+st_autorefresh(interval=AUTO_REFRESH_MS, key="auto_refresh_15m")
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS)
@@ -404,9 +598,29 @@ if not use_pooled:
             st.error(f"ML training failed: {e}")
             st.stop()
 
-# Apply confidence filter — overrides to FLAT when conf < 15%.
-xgb_sig = apply_confidence_filter(xgb_sig)
-xgb_call = {"long": 1, "short": -1, "flat": 0}[xgb_sig["signal"]]
+# ─── New tier classifier (replaces binary 75% confidence filter for 10-day signal) ───
+# Compute trend + momentum scores from the already-loaded df.
+tm_result = trend_momentum.analyze_from_frame(df, symbol=symbol)
+if tm_result is not None:
+    _trend_score = tm_result.trend_score
+    _momentum_score = tm_result.momentum_score
+    _swing_low_20d = float(df["low"].rolling(20).min().iloc[-1])
+    _swing_high_20d = float(df["high"].rolling(20).max().iloc[-1])
+else:
+    _trend_score = 0.0
+    _momentum_score = 0.0
+    _swing_low_20d = float("nan")
+    _swing_high_20d = float("nan")
+
+trade_signal = signals_mod.classify_signal(
+    proba=float(xgb_sig["proba"]),
+    trend_score=_trend_score, momentum_score=_momentum_score,
+    adx=float(df["adx"].iloc[-1]) if "adx" in df.columns else float("nan"),
+    rsi=float(df["rsi_14"].iloc[-1]),
+)
+xgb_call = trade_signal.direction  # -1, 0, +1
+# Keep legacy fields populated for the strategy-votes display
+xgb_sig["signal"] = {1: "long", -1: "short", 0: "flat"}[xgb_call]
 
 # ─── Rule-based strategies (secondary context) ───
 positions_by_strategy = {
@@ -499,62 +713,126 @@ if live and live["price"] > 0:
         unsafe_allow_html=True,
     )
 
-# ─── Big recommendation card (XGBoost is the headline) ───
-action_label = {1: "BUY LONG", -1: "SELL SHORT", 0: "STAY FLAT"}[recommendation_call]
-action_color = {1: "#00E68A", -1: "#FF4757", 0: "#FF9F43"}[recommendation_call]
-
-filtered_note = ""
-if xgb_sig.get("filtered"):
-    raw_sig = xgb_sig.get("signal_raw", "?").upper()
-    filtered_note = f"<div style='font-size:10px; color:#FFD93D; margin-top:4px;'>filtered: model leaned {raw_sig} but conf {xgb_sig['confidence']:.0%} below 15% threshold</div>"
+# ─── Big recommendation card (tiered classifier output) ───
+ts = trade_signal
+stars_filled = "★" * ts.conviction
+stars_empty = "★" * (5 - ts.conviction)
+reasoning_html = "".join(
+    f"<li style='margin:3px 0; color:#bbb; font-size:12px;'>{r}</li>"
+    for r in ts.reasoning
+)
+conf_str = f"{ts.confluence}"
+conf_color = {
+    "aligned": "#00E68A", "opposed": "#FF4757",
+    "mixed": "#FF9F43", "neutral": "#888",
+}.get(ts.confluence, "#888")
 
 st.markdown(
     f"""
-    <div style="background:{action_color}22; border:2px solid {action_color};
-                border-radius:12px; padding:24px; text-align:center; margin:16px 0;">
-        <div style="font-size:11px; color:#888; letter-spacing:1.5px;">10-DAY PREDICTION</div>
-        <div style="font-size:42px; font-weight:700; color:{action_color}; margin:8px 0;">{action_label}</div>
-        <div style="font-size:13px; color:#aaa;">
-            P(up) <b>{xgb_sig['proba']:.1%}</b> · conf <b>{xgb_sig['confidence']:.0%}</b>
+    <div style="background:{ts.color}22; border:2px solid {ts.color};
+                border-radius:12px; padding:22px; margin:16px 0;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div style="font-size:11px; color:#888; letter-spacing:1.5px;">10-DAY PREDICTION · TIER</div>
+            <div style="font-size:14px; color:{ts.color}; letter-spacing:1px;">
+                {stars_filled}<span style="color:#333">{stars_empty}</span>
+                <span style="color:#aaa; font-size:11px; margin-left:6px;">conviction {ts.conviction}/5</span>
+            </div>
         </div>
-        {filtered_note}
-        <div style="font-size:10px; color:#666; margin-top:6px;">{model_label}</div>
+        <div style="font-size:38px; font-weight:700; color:{ts.color}; margin:6px 0; text-align:center;">{ts.label}</div>
+        <div style="text-align:center; font-size:13px; color:#aaa;">
+            P(up) <b>{ts.proba:.1%}</b>
+            &nbsp;·&nbsp; trend <b>{ts.trend_score:+.2f}</b>
+            &nbsp;·&nbsp; momentum <b>{ts.momentum_score:+.2f}</b>
+            &nbsp;·&nbsp; confluence <b style="color:{conf_color};">{conf_str}</b>
+        </div>
+        <ul style="margin:14px 0 4px 0; padding-left:22px;">
+            {reasoning_html}
+        </ul>
+        <div style="font-size:10px; color:#666; margin-top:8px; text-align:right;">{model_label}</div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-# ─── ATR-based stop suggestion ───
-if recommendation_call != 0:
-    atr_value = df["atr_14"].iloc[-1]
-    if not pd.isna(atr_value) and last_close > 0:
-        atr_pct = float(atr_value) / float(last_close)
-        stop_dist_pct = 2.5 * atr_pct
-        is_long = recommendation_call > 0
-        if is_long:
-            stop_price = last_close * (1 - stop_dist_pct)
-            tp_price = last_close * (1 + stop_dist_pct)
-            stop_dir, tp_dir = "below", "above"
-        else:
-            stop_price = last_close * (1 + stop_dist_pct)
-            tp_price = last_close * (1 - stop_dist_pct)
-            stop_dir, tp_dir = "above", "below"
-        risk_per_share = abs(last_close - stop_price)
-        # Setup B: 30 trading-day time stop (~42 calendar days). The model predicts
-        # the next 10-day direction, but holding longer captures more of the move
-        # — TP exits jumped from 29% → 49% with the longer time stop in backtests.
-        time_stop = (last_date + timedelta(days=42)).strftime("%b %d")
+# ─── Structural sizing card (replaces fixed 2.5×ATR / 1:1 R:R block) ───
+if xgb_call != 0:
+    atr_value = float(df["atr_14"].iloc[-1])
+    adx_value = float(df["adx"].iloc[-1]) if "adx" in df.columns else float("nan")
+    sizing = signals_mod.size_position(
+        direction=xgb_call,
+        spot=float(last_close),
+        atr=atr_value,
+        conviction=ts.conviction,
+        account_size=float(account_size),
+        base_risk_pct=float(base_risk_pct),
+        adx=adx_value,
+        swing_low_20d=_swing_low_20d,
+        swing_high_20d=_swing_high_20d,
+        horizon_days=10,
+        last_date=last_date,
+    )
+    if sizing is not None:
+        notes_html = "".join(
+            f"<div style='font-size:11px; color:#FFD93D; margin-top:4px;'>⚠ {n}</div>"
+            for n in sizing.notes
+        )
+        rp_color = "#FF4757"; tp_color = "#00E68A"
         st.markdown(
             f"""
-            <div style="background:#1A1B24; border:1px solid #2A2B38; border-left:3px solid {action_color};
-                        border-radius:6px; padding:10px 14px; margin:-10px 0 16px 0; font-size:12px; color:#aaa;">
-                <b style="color:#ccc;">Suggested levels</b> <span style="color:#666;">(2.5× ATR, 1:1 R:R)</span>
-                &nbsp;·&nbsp; Entry <b style="color:#fff;">${last_close:.2f}</b>
-                &nbsp;·&nbsp; Stop <b style="color:#FF4757;">${stop_price:.2f}</b>
-                <span style="color:#666;">({stop_dist_pct*100:.1f}% {stop_dir}, risk ${risk_per_share:.2f}/sh)</span>
-                &nbsp;·&nbsp; TP <b style="color:#00E68A;">${tp_price:.2f}</b>
-                <span style="color:#666;">({stop_dist_pct*100:.1f}% {tp_dir})</span>
-                &nbsp;·&nbsp; Time-stop <b style="color:#FFD93D;">{time_stop}</b>
+            <div style="background:#1A1B24; border:1px solid #2A2B38; border-left:4px solid {ts.color};
+                        border-radius:8px; padding:14px 16px; margin:-8px 0 16px 0;">
+                <div style="font-size:11px; color:#888; letter-spacing:1.5px; margin-bottom:8px;">
+                    POSITION SIZING · {sizing.rr_ratio:.0f}:1 R:R
+                </div>
+                <div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:10px; font-size:12px;">
+                    <div>
+                        <div style="color:#888; font-size:10px;">ENTRY</div>
+                        <div style="color:#fff; font-size:16px; font-weight:600;">${sizing.entry:.2f}</div>
+                    </div>
+                    <div>
+                        <div style="color:#888; font-size:10px;">STOP</div>
+                        <div style="color:{rp_color}; font-size:16px; font-weight:600;">${sizing.stop:.2f}</div>
+                        <div style="color:#666; font-size:10px;">{sizing.pct_to_stop:+.1f}% · risk ${sizing.risk_per_share:.2f}/sh</div>
+                    </div>
+                    <div>
+                        <div style="color:#888; font-size:10px;">TAKE PROFIT</div>
+                        <div style="color:{tp_color}; font-size:16px; font-weight:600;">${sizing.take_profit:.2f}</div>
+                        <div style="color:#666; font-size:10px;">{sizing.pct_to_tp:+.1f}% · reward ${sizing.reward_per_share:.2f}/sh</div>
+                    </div>
+                    <div>
+                        <div style="color:#888; font-size:10px;">TIME STOP</div>
+                        <div style="color:#FFD93D; font-size:16px; font-weight:600;">{sizing.time_stop_date}</div>
+                        <div style="color:#666; font-size:10px;">{sizing.horizon_days*3} trading days</div>
+                    </div>
+                </div>
+                <hr style="border:none; border-top:1px solid #2A2B38; margin:12px 0 8px 0;">
+                <div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:10px; font-size:12px;">
+                    <div>
+                        <div style="color:#888; font-size:10px;">POSITION SIZE</div>
+                        <div style="color:#fff; font-size:16px; font-weight:600;">{sizing.n_shares} sh</div>
+                        <div style="color:#666; font-size:10px;">${sizing.position_value:,.0f} ({sizing.position_value/account_size*100:.1f}% of acct)</div>
+                    </div>
+                    <div>
+                        <div style="color:#888; font-size:10px;">RISK</div>
+                        <div style="color:{rp_color}; font-size:16px; font-weight:600;">${sizing.risk_dollar:,.0f}</div>
+                        <div style="color:#666; font-size:10px;">{sizing.risk_pct_of_account*100:.2f}% of account</div>
+                    </div>
+                    <div>
+                        <div style="color:#888; font-size:10px;">POTENTIAL REWARD</div>
+                        <div style="color:{tp_color}; font-size:16px; font-weight:600;">${sizing.n_shares * sizing.reward_per_share:,.0f}</div>
+                        <div style="color:#666; font-size:10px;">at TP</div>
+                    </div>
+                    <div>
+                        <div style="color:#888; font-size:10px;">EFFECTIVE RISK %</div>
+                        <div style="color:#fff; font-size:16px; font-weight:600;">{sizing.effective_risk_pct*100:.2f}%</div>
+                        <div style="color:#666; font-size:10px;">{base_risk_pct*100:.2f}% × {ts.conviction}/5 conv</div>
+                    </div>
+                </div>
+                <div style="font-size:11px; color:#888; margin-top:10px;">
+                    <span style="color:#aaa;">Stop basis:</span> {sizing.stop_basis}
+                    &nbsp;·&nbsp; <span style="color:#aaa;">TP basis:</span> {sizing.tp_basis}
+                </div>
+                {notes_html}
             </div>
             """,
             unsafe_allow_html=True,
@@ -774,5 +1052,5 @@ with st.expander("Feature importance"):
         st.bar_chart(imp_df.set_index("Feature"), horizontal=True)
 
 st.caption(
-    f"daily bars · 10d horizon · {src_name} · auto-refreshes every 2h · live spot every 30s · not financial advice"
+    f"daily bars · 10d horizon · {src_name} · auto-refreshes every 15 min · live spot every 30s · not financial advice"
 )
