@@ -32,7 +32,7 @@ from data import analyst as analyst_src
 import indicators
 import regime
 import ml
-import class_xgb
+import backtest
 
 st.set_page_config(page_title="Long or Short?", page_icon="$", layout="centered")
 
@@ -71,7 +71,17 @@ if not symbol:
     st.stop()
 
 MIN_CONFIDENCE = 0.25  # raised from 0.15 → higher accuracy, fewer signals
-START_ISO = (date.today() - timedelta(days=3 * 365)).isoformat()
+
+# Proven-edge gate: BUY/SELL only fires if the walk-forward backtest on THIS
+# symbol historically cleared these bars. Otherwise the model has no verified
+# edge here and the honest answer is HOLD.
+MIN_EDGE_WINRATE = 0.55
+MIN_EDGE_TRADES = 15
+MIN_EDGE_SHARPE = 0.3
+
+# 4 years of history: ~1000 bars → 500 to train the walk-forward model and
+# ~500 out-of-sample bars to actually verify the edge.
+START_ISO = (date.today() - timedelta(days=4 * 365)).isoformat()
 
 
 @st.cache_data(show_spinner=False)
@@ -127,6 +137,27 @@ def get_ml_signal(sym: str, _df_hash: int) -> dict:
     return max(signals, key=lambda s: s.get("confidence", 0.0))
 
 
+@st.cache_data(show_spinner=False)
+def check_edge(sym: str, _df_hash: int) -> dict | None:
+    """Walk-forward backtest on this exact symbol: does the model actually
+    have a historical edge here? Returns metrics, or None if history is too
+    short to verify (in which case we do NOT trade)."""
+    try:
+        macro_df = load_macro()
+        wf = ml.EnsembleWalkForward(train_size=500, step_size=60)
+        positions = wf.positions(df, macro_df=macro_df)
+        result = backtest.run(df, positions, fee_bps=1.0, slippage_bps=1.0)
+        m = result.metrics
+        return {
+            "win_rate": float(m.get("win_rate", 0.0)),
+            "sharpe": float(m.get("sharpe", 0.0)),
+            "trades": int(m.get("trades", 0)),
+            "total_return": float(m.get("total_return", 0.0)),
+        }
+    except Exception:
+        return None
+
+
 def compute_trend(df: pd.DataFrame) -> tuple[str, str]:
     """Return (label, emoji) describing the current trend."""
     latest_regime = df["regime"].dropna().iloc[-1] if "regime" in df.columns and not df["regime"].dropna().empty else "ranging"
@@ -146,16 +177,43 @@ def compute_trend(df: pd.DataFrame) -> tuple[str, str]:
     return "SIDEWAYS", "→"
 
 
-def gated_signal(ml_sig: dict, analyst: dict | None) -> tuple[str, str, str]:
-    """Apply consensus gating. Returns (label, css_class, rationale)."""
+def gated_signal(
+    ml_sig: dict,
+    analyst: dict | None,
+    edge: dict | None,
+    trend_label: str,
+) -> tuple[str, str, str]:
+    """Apply all gates: confidence, proven edge, trend veto, analyst consensus.
+    Returns (label, css_class, rationale). Any gate failure → HOLD, because
+    an unverified signal is how money gets lost."""
     ml_dir = ml_sig.get("signal", "flat")
     conf = ml_sig.get("confidence", 0.0)
 
-    # Confidence gate
-    if conf < MIN_CONFIDENCE:
-        return "HOLD", "hold", f"Model confidence {conf*100:.0f}% below {MIN_CONFIDENCE*100:.0f}% threshold"
+    if ml_dir == "flat":
+        return "HOLD", "hold", "Model has no directional edge right now"
 
-    # Analyst gate (skip if analyst data unavailable — e.g. crypto)
+    # Gate 1: model confidence
+    if conf < MIN_CONFIDENCE:
+        return "HOLD", "hold", f"Model confidence {conf*100:.0f}% below {MIN_CONFIDENCE*100:.0f}% threshold — not worth the risk"
+
+    # Gate 2: proven edge on THIS symbol. No verified history → no trade.
+    if edge is None:
+        return "HOLD", "hold", "Not enough history to verify the model works on this symbol — refusing to guess"
+    if edge["trades"] < MIN_EDGE_TRADES:
+        return "HOLD", "hold", f"Only {edge['trades']} historical trades on this symbol — sample too small to trust"
+    if edge["win_rate"] < MIN_EDGE_WINRATE or edge["sharpe"] < MIN_EDGE_SHARPE:
+        return "HOLD", "hold", (
+            f"Model's track record here is weak ({edge['win_rate']*100:.0f}% win rate, "
+            f"Sharpe {edge['sharpe']:.2f}) — it has no proven edge on {symbol}"
+        )
+
+    # Gate 3: trend veto — don't fight strong momentum
+    if ml_dir == "long" and trend_label in ("STRONG DOWNTREND", "VOLATILE / CRASHING"):
+        return "HOLD", "hold", "Model bullish but price is in a strong downtrend — not catching falling knives"
+    if ml_dir == "short" and trend_label == "STRONG UPTREND":
+        return "HOLD", "hold", "Model bearish but price is in a strong uptrend — not fighting momentum"
+
+    # Gate 4: analyst consensus (skip if no coverage — e.g. crypto, ETFs)
     if analyst is not None and analyst.get("num_analysts", 0) >= 5:
         an_dir = analyst.get("direction", "flat")
         if ml_dir == "long" and an_dir == "down":
@@ -163,17 +221,16 @@ def gated_signal(ml_sig: dict, analyst: dict | None) -> tuple[str, str, str]:
         if ml_dir == "short" and an_dir == "up":
             return "HOLD", "hold", "Model bearish but analysts see upside — no consensus"
 
+    track = f"verified {edge['win_rate']*100:.0f}% historical win rate on {symbol} ({edge['trades']} trades)"
     if ml_dir == "long":
-        rationale = f"Model {conf*100:.0f}% confident of upside"
+        rationale = f"Model {conf*100:.0f}% confident of upside · {track}"
         if analyst and analyst.get("num_analysts", 0) >= 5 and analyst.get("direction") == "up":
             rationale += f" · {analyst['num_analysts']} analysts agree"
         return "BUY", "buy", rationale
-    if ml_dir == "short":
-        rationale = f"Model {conf*100:.0f}% confident of downside"
-        if analyst and analyst.get("num_analysts", 0) >= 5 and analyst.get("direction") == "down":
-            rationale += f" · {analyst['num_analysts']} analysts agree"
-        return "SELL", "sell", rationale
-    return "HOLD", "hold", "Model has no directional edge"
+    rationale = f"Model {conf*100:.0f}% confident of downside · {track}"
+    if analyst and analyst.get("num_analysts", 0) >= 5 and analyst.get("direction") == "down":
+        rationale += f" · {analyst['num_analysts']} analysts agree"
+    return "SELL", "sell", rationale
 
 
 # ─── Load everything in parallel spinners ───
@@ -194,9 +251,12 @@ with st.spinner("Fetching Wall Street analyst consensus..."):
 with st.spinner("Running ML ensemble..."):
     ml_sig = get_ml_signal(symbol, len(df))
 
+with st.spinner(f"Verifying the model's track record on {symbol} (walk-forward backtest)..."):
+    edge = check_edge(symbol, len(df))
+
 # ─── Compute the three things ───
 trend_label, trend_emoji = compute_trend(df)
-signal, css, rationale = gated_signal(ml_sig, analyst)
+signal, css, rationale = gated_signal(ml_sig, analyst, edge, trend_label)
 current_price = float(df["close"].iloc[-1])
 
 # ─── Render — three big cards ───
@@ -215,17 +275,48 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# 2. Buy / Sell / Hold
+# 2. Buy / Sell / Hold — with the exact exit plan when a trade fires.
+# Cutting losers at the stop is what keeps a 56% win rate profitable;
+# riding them down is what turns it into losses.
+atr = float(df["atr_14"].iloc[-1]) if "atr_14" in df.columns else current_price * 0.02
+if signal == "BUY":
+    stop_price = current_price - 2.5 * atr
+    target_price_atr = current_price + 2.5 * atr
+    exit_plan = (
+        f"Stop loss: ${stop_price:.2f} (−{2.5*atr/current_price*100:.1f}%) · "
+        f"Take profit: ${target_price_atr:.2f} · Exit after 30 trading days regardless"
+    )
+elif signal == "SELL":
+    stop_price = current_price + 2.5 * atr
+    target_price_atr = current_price - 2.5 * atr
+    exit_plan = (
+        f"Stop loss: ${stop_price:.2f} (+{2.5*atr/current_price*100:.1f}%) · "
+        f"Take profit: ${target_price_atr:.2f} · Exit after 30 trading days regardless"
+    )
+else:
+    exit_plan = "Stay out. Cash is a position — a skipped bad trade is money kept."
+
 st.markdown(
     f"""
     <div class="big-card {css}">
       <div class="stat-lbl">Recommendation</div>
       <div class="big-signal">{signal}</div>
       <div class="big-caption">{rationale}</div>
+      <div class="big-caption" style="margin-top:12px; font-weight:600;">{exit_plan}</div>
     </div>
     """,
     unsafe_allow_html=True,
 )
+
+# Model track record on this symbol (the evidence behind the call)
+if edge is not None:
+    edge_ok = edge["win_rate"] >= MIN_EDGE_WINRATE and edge["sharpe"] >= MIN_EDGE_SHARPE and edge["trades"] >= MIN_EDGE_TRADES
+    verdict = "✓ verified edge" if edge_ok else "✗ no proven edge — signals blocked"
+    st.caption(
+        f"Model track record on {symbol} (walk-forward, ~2y out-of-sample): "
+        f"{edge['win_rate']*100:.0f}% win rate · Sharpe {edge['sharpe']:.2f} · "
+        f"{edge['trades']} trades · {edge['total_return']*100:+.1f}% return · {verdict}"
+    )
 
 # 3. Target Price
 if analyst and analyst.get("mean_target"):
@@ -274,6 +365,8 @@ else:
     )
 
 st.caption(
-    "Signals require model confidence ≥25% AND analyst-consensus agreement. "
-    "Past performance does not guarantee future results."
+    "BUY/SELL only fires when ALL gates pass: model confidence ≥25%, verified historical "
+    "edge on this exact symbol (≥55% win rate, positive Sharpe), trend alignment, and "
+    "analyst-consensus agreement. Risk max 1–2% of your account per trade and always place "
+    "the stop-loss order. Past performance does not guarantee future results."
 )
