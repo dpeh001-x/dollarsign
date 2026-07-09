@@ -7,6 +7,10 @@ walk-forward driver swap models without touching its plumbing.
 Hyperparameters are tuned to be roughly comparable: ~100 weak learners,
 shallow depth (3), modest learning rate (0.05). Linear baseline is
 included to confirm gradient boosting is actually adding value.
+
+All gradient-boosted models are wrapped with CalibratedClassifierCV (isotonic
+regression, cv=3). Gradient boosters tend to output over-confident probabilities;
+calibration corrects this, which matters for the deadband confidence filter.
 """
 from __future__ import annotations
 
@@ -14,8 +18,16 @@ import logging
 
 import numpy as np
 import pandas as pd
+from sklearn.calibration import CalibratedClassifierCV
 
 logger = logging.getLogger(__name__)
+
+
+def _calibrate(base_model, X, y):
+    """Wrap a fitted-or-unfitted model with isotonic calibration."""
+    cal = CalibratedClassifierCV(base_model, method="isotonic", cv=3)
+    cal.fit(X, y)
+    return cal
 
 
 def fit_xgboost(X, y, **overrides):
@@ -27,9 +39,7 @@ def fit_xgboost(X, y, **overrides):
         tree_method="hist", verbosity=0, n_jobs=1,
     )
     params.update(overrides)
-    model = XGBClassifier(**params)
-    model.fit(X, y)
-    return model
+    return _calibrate(XGBClassifier(**params), X, y)
 
 
 def fit_lightgbm(X, y, **overrides):
@@ -40,9 +50,7 @@ def fit_lightgbm(X, y, **overrides):
         reg_lambda=1.0, random_state=42, verbosity=-1, n_jobs=1,
     )
     params.update(overrides)
-    model = LGBMClassifier(**params)
-    model.fit(X, y)
-    return model
+    return _calibrate(LGBMClassifier(**params), X, y)
 
 
 def fit_catboost(X, y, **overrides):
@@ -53,9 +61,7 @@ def fit_catboost(X, y, **overrides):
         thread_count=1, allow_writing_files=False,
     )
     params.update(overrides)
-    model = CatBoostClassifier(**params)
-    model.fit(X, y)
-    return model
+    return _calibrate(CatBoostClassifier(**params), X, y)
 
 
 def fit_hist_gbm(X, y, **overrides):
@@ -65,9 +71,7 @@ def fit_hist_gbm(X, y, **overrides):
         l2_regularization=1.0, random_state=42,
     )
     params.update(overrides)
-    model = HistGradientBoostingClassifier(**params)
-    model.fit(X, y)
-    return model
+    return _calibrate(HistGradientBoostingClassifier(**params), X, y)
 
 
 def fit_random_forest(X, y, **overrides):
@@ -77,9 +81,7 @@ def fit_random_forest(X, y, **overrides):
         random_state=42, n_jobs=1,
     )
     params.update(overrides)
-    model = RandomForestClassifier(**params)
-    model.fit(X, y)
-    return model
+    return _calibrate(RandomForestClassifier(**params), X, y)
 
 
 def fit_logistic(X, y, **overrides):
@@ -114,12 +116,22 @@ def walk_forward_predict(
     feature_cols: list[str],
     train_size: int = 500,
     step_size: int = 60,
+    purge: int = 0,
+    embargo: int = 0,
     **fit_kwargs,
 ) -> pd.Series:
     """Generic walk-forward driver. Returns P(up) series aligned to features_df.index.
 
     First `train_size` rows get NaN (no model trained yet). Strict OOS:
     each prediction comes from a model trained on rows strictly before it.
+
+    purge:   drop the last `purge` rows from each training window. With a
+             10-day prediction horizon, the last 10 target values are computed
+             from returns that overlap the test window — purging eliminates
+             this label leakage.
+    embargo: skip the first `embargo` rows of each test window. These rows
+             immediately follow the training cutoff and may share return data
+             with the training labels.
     """
     n = len(features_df)
     if n < train_size + 30:
@@ -129,9 +141,18 @@ def walk_forward_predict(
 
     i = train_size
     while i < n:
-        train = features_df.iloc[i - train_size: i].dropna(subset=feature_cols + ["target"])
+        # Purge: drop the last `purge` rows of the training window to avoid
+        # overlapping forward-return labels leaking into the test period.
+        train_end = i - purge if purge > 0 else i
+        train = features_df.iloc[i - train_size: train_end].dropna(subset=feature_cols + ["target"])
+
+        # Embargo: skip rows immediately after the training cutoff
+        test_start = i + embargo
         test_end = min(i + step_size, n)
-        test = features_df.iloc[i: test_end].dropna(subset=feature_cols)
+        if test_start >= test_end:
+            i += step_size
+            continue
+        test = features_df.iloc[test_start: test_end].dropna(subset=feature_cols)
 
         if len(train) < 50 or len(test) == 0:
             i += step_size

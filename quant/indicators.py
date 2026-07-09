@@ -117,6 +117,24 @@ def rolling_drawdown(close: pd.Series, length: int = 20) -> pd.Series:
     return (close - rolling_max) / rolling_max
 
 
+def obv(df: pd.DataFrame) -> pd.Series:
+    """On-Balance Volume: cumulative volume signed by daily price direction."""
+    direction = np.sign(df["close"].diff()).fillna(0)
+    return (direction * df["volume"]).cumsum()
+
+
+def vol_ratio(df: pd.DataFrame, length: int = 20) -> pd.Series:
+    """Today's volume relative to trailing mean — volume confirmation signal."""
+    avg = df["volume"].rolling(length).mean()
+    return df["volume"] / avg.replace(0, np.nan)
+
+
+def hi52_dist(df: pd.DataFrame) -> pd.Series:
+    """Distance from 52-week high as negative pct. 0 = at 52w high, -1 = 100% below."""
+    high_52w = df["close"].rolling(252).max()
+    return (df["close"] - high_52w) / high_52w.replace(0, np.nan)
+
+
 def attach_all(df: pd.DataFrame) -> pd.DataFrame:
     """Attach a standard battery of indicators to an OHLCV frame. Returns a copy."""
     out = df.copy()
@@ -131,4 +149,7 @@ def attach_all(df: pd.DataFrame) -> pd.DataFrame:
     out = out.join(adx(out, 14))
     out["vol_20"] = realized_vol(out["close"], 20)
     out["dd_20"] = rolling_drawdown(out["close"], 20)
+    out["obv"] = obv(out)
+    out["vol_ratio_20"] = vol_ratio(out, 20)
+    out["hi52_dist"] = hi52_dist(out)
     return out

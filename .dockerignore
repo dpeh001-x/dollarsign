@@ -1,0 +1,10 @@
+.git
+.venv
+**/__pycache__
+quant/cache
+backend
+prediction-market-platform.jsx
+deploy
+*.desktop
+icon.png
+start.sh

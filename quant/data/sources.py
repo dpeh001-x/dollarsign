@@ -104,6 +104,10 @@ def _fetch_yfinance(symbol: str, start: str, end: str, timeframe: str = "1Day") 
 
 SOURCE_ORDER_AUTO = ("alpaca", "polygon", "yfinance")
 
+# Non-US exchange suffixes (and ^index tickers) that Alpaca/Polygon don't
+# carry — route these straight to yfinance instead of failing through the chain.
+YFINANCE_ONLY_SUFFIXES = (".HK", ".SI", ".SS", ".SZ", ".T", ".L", ".AX", ".TO", ".NS")
+
 
 def get_bars(
     symbol: str,
@@ -127,7 +131,11 @@ def get_bars(
         return pd.read_parquet(cache_file)
 
     if prefer == "auto":
-        candidates = SOURCE_ORDER_AUTO
+        sym_u = symbol.upper()
+        if sym_u.endswith(YFINANCE_ONLY_SUFFIXES) or sym_u.startswith("^"):
+            candidates = ("yfinance",)
+        else:
+            candidates = SOURCE_ORDER_AUTO
     else:
         candidates = (prefer,)
 
