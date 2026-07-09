@@ -11,9 +11,9 @@ Critical: leakage control. At cutoff date T, training rows are filtered
 to those whose forward_date (date + horizon trading days) is also < T —
 otherwise the target depends on data at or after T, leaking the future.
 
-Same regime/feature pipeline as ml.py; same WF cadence (train_size=750,
-step_size=60). Per-symbol regime model is fit on each symbol's own data;
-the pooled model just consumes the regime feature like any other.
+Same feature pipeline as ml.py; same WF cadence (train_size=750,
+step_size=60). Regime labels are computed per symbol for display/strategy
+use but are NOT model features (full-history K-means leaks the future).
 """
 from __future__ import annotations
 
@@ -240,7 +240,7 @@ def predict_today_for_class_ensemble(
         if fit_fn is None:
             continue
         try:
-            fitted[name] = fit_fn(X, y)
+            fitted[name] = fit_fn(X, y, sample_weight=_models.date_recency_weights(train["date"]))
         except Exception as e:
             logger.warning("ensemble pool: %s fit failed: %s", name, e)
 
@@ -370,7 +370,7 @@ def predict_class_ensemble(
             if fit_fn is None:
                 continue
             try:
-                m = fit_fn(X_train, y_train)
+                m = fit_fn(X_train, y_train, sample_weight=_models.date_recency_weights(train["date"]))
                 model_probas.append(m.predict_proba(X_test)[:, 1])
             except Exception as e:
                 logger.debug("ens pool WF %s at %s: %s", name, cutoff, e)

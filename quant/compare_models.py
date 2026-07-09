@@ -34,12 +34,25 @@ logging.basicConfig(level=logging.WARNING)
 np.random.seed(42)
 
 
+def _market_ctx(start: str):
+    try:
+        from datetime import datetime, timezone
+        from data import macro as macro_src
+        end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        return macro_src.get_market_context(start, end)
+    except Exception as e:
+        print(f"  (market context unavailable: {e})")
+        return None
+
+
 def prepare_for_ml(symbol: str, start: str, horizon: int = 10) -> pd.DataFrame:
-    """Load OHLCV, attach indicators+regime, build features."""
+    """Load OHLCV, attach indicators+regime, build features (incl. macro/SPY
+    context — without it 6 of the 24 features are dead constants and the
+    comparison can't see them)."""
     df = sources.get_bars(symbol, start, use_cache=True)
     df = indicators.attach_all(df)
     df = regime.label(df)
-    feats = ml.make_features(df, horizon=horizon)
+    feats = ml.make_features(df, horizon=horizon, macro_df=_market_ctx(start))
     return df, feats
 
 
@@ -93,7 +106,7 @@ def run_pooled_class(
     if not symbol_dfs:
         return {}
 
-    pooled = class_xgb.build_pooled_features(symbol_dfs, horizon=horizon)
+    pooled = class_xgb.build_pooled_features(symbol_dfs, horizon=horizon, macro_df=_market_ctx(start))
     feat_cols = list(ml.FEATURE_COLS)
 
     # Normalize date types for pooled walk-forward (matches class_xgb logic)

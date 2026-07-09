@@ -78,13 +78,15 @@ def run(
 
     # Metrics over the ACTIVE period only: the warmup bars before the first
     # position (500+ flat bars in walk-forward runs) would deflate CAGR and
-    # distort Sharpe if included.
+    # distort Sharpe if included. Start one bar BEFORE the first held bar —
+    # that's where the entry cost lands (pos changes at t, return earned at
+    # t+1) — so the entry fee and the first active bar's PnL are both counted.
     active = held.ne(0)
     if active.any():
-        start_i = int(active.to_numpy().argmax())
-        metrics = _compute_metrics(net_ret.iloc[start_i:], equity.iloc[start_i:], trades, bars_per_year)
+        start_i = max(int(active.to_numpy().argmax()) - 1, 0)
+        metrics = _compute_metrics(net_ret.iloc[start_i:], trades, bars_per_year)
     else:
-        metrics = _compute_metrics(net_ret, equity, trades, bars_per_year)
+        metrics = _compute_metrics(net_ret, trades, bars_per_year)
 
     return BacktestResult(
         equity=equity,
@@ -128,9 +130,13 @@ def _extract_trades(pos: pd.Series, close: pd.Series, total_cost_bps: float) -> 
     return pd.DataFrame(trades)
 
 
-def _compute_metrics(net_ret: pd.Series, equity: pd.Series, trades: pd.DataFrame, bars_per_year: int) -> dict[str, float]:
+def _compute_metrics(net_ret: pd.Series, trades: pd.DataFrame, bars_per_year: int) -> dict[str, float]:
+    """Metrics from a net-return slice. The equity curve is rebuilt from the
+    slice itself (inclusive of its first bar) so total_return, Sharpe, and
+    drawdown are all computed over exactly the same window."""
     bars = len(net_ret)
-    total_return = equity.iloc[-1] / equity.iloc[0] - 1 if len(equity) else 0.0
+    equity = (1 + net_ret).cumprod() if bars else pd.Series(dtype=float)
+    total_return = equity.iloc[-1] - 1 if bars else 0.0
     years = bars / bars_per_year if bars_per_year else 1.0
     cagr = (1 + total_return) ** (1 / years) - 1 if years > 0 and total_return > -1 else 0.0
 

@@ -122,12 +122,19 @@ def make_features(
         # VIX term structure: VIX/VIX3M > 1 (backwardation) = stress; < 1 = calm
         out["vix_ts"] = macro_aligned.get("vix_ts", pd.Series(np.nan, index=out.index)).fillna(1.0)
         # Cross-asset context: broad-market momentum + relative strength.
-        # Neutral 0.0 when SPY data is missing (feature contributes nothing).
-        spy5 = macro_aligned.get("spy_ret_5", pd.Series(np.nan, index=out.index)).fillna(0.0)
-        spy20 = macro_aligned.get("spy_ret_20", pd.Series(np.nan, index=out.index)).fillna(0.0)
-        out["spy_ret_5"] = spy5
-        out["spy_ret_20"] = spy20
-        out["rel_20"] = out["ret_20"] - spy20  # stays NaN where ret_20 is NaN (row dropped anyway)
+        # If the SPY columns are absent entirely (older cache / SPY fetch
+        # failure), zero all three — otherwise rel_20 would silently become a
+        # duplicate of ret_20.
+        if "spy_ret_20" in macro_df.columns:
+            spy5 = macro_aligned.get("spy_ret_5", pd.Series(np.nan, index=out.index)).fillna(0.0)
+            spy20 = macro_aligned["spy_ret_20"].fillna(0.0)
+            out["spy_ret_5"] = spy5
+            out["spy_ret_20"] = spy20
+            out["rel_20"] = out["ret_20"] - spy20  # stays NaN where ret_20 is NaN (row dropped anyway)
+        else:
+            out["spy_ret_5"] = 0.0
+            out["spy_ret_20"] = 0.0
+            out["rel_20"] = 0.0
     else:
         out["vix_level"] = _VIX_NEUTRAL
         out["vix_change"] = 0.0
@@ -191,9 +198,14 @@ def fit_xgb(features_df: pd.DataFrame, **xgb_params) -> XGBClassifier:
     if y.nunique() < 2:
         raise ValueError("Target has only one class — need both up and down samples")
     model = XGBClassifier(**_xgb_defaults(**xgb_params))
-    # Recency weighting: rows are chronological, so weight decays backwards
-    # from the most recent row (half-life ~2 trading years).
-    w = np.power(0.5, np.arange(len(y) - 1, -1, -1, dtype=float) / 504.0)
+    # Recency weighting (half-life ~2 trading years). Pooled frames carry a
+    # "date" column and interleave many symbols per date — decay by date age
+    # there, or the effective half-life shrinks by the symbol count.
+    import models as _models
+    if "date" in train.columns:
+        w = _models.date_recency_weights(train["date"])
+    else:
+        w = _models.recency_weights(len(y))
     model.fit(X, y, sample_weight=w)
     return model
 

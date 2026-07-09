@@ -34,8 +34,25 @@ RECENCY_HALF_LIFE = 504  # trading days (~2y) until a row's weight halves
 
 
 def recency_weights(n: int, half_life: int = RECENCY_HALF_LIFE) -> np.ndarray:
-    """Exponential-decay sample weights; the last (most recent) row gets 1.0."""
+    """Exponential-decay sample weights; the last (most recent) row gets 1.0.
+
+    ONLY for single-symbol chronological frames (one row per date). For pooled
+    frames that interleave many symbols per date, use date_recency_weights —
+    row-based decay there compresses the half-life by the symbol count.
+    """
     age = np.arange(n - 1, -1, -1, dtype=float)
+    return np.power(0.5, age / half_life)
+
+
+def date_recency_weights(dates, half_life: int = RECENCY_HALF_LIFE) -> np.ndarray:
+    """Exponential-decay weights by DATE age (in unique trading dates), so
+    pooled multi-symbol frames decay at the intended calendar rate: all rows
+    sharing a date get the same weight."""
+    d = pd.to_datetime(pd.Series(dates).reset_index(drop=True), utc=True)
+    uniq = np.sort(d.dropna().unique())
+    rank = {v: k for k, v in enumerate(uniq)}          # oldest date -> 0
+    newest = len(uniq) - 1
+    age = d.map(lambda v: newest - rank.get(v, 0)).to_numpy(dtype=float)
     return np.power(0.5, age / half_life)
 
 
@@ -45,7 +62,13 @@ def _calibrate(base_model, X, y, sample_weight=None):
     not isotonic: our ~160-sample calibration folds are far below the ~1000
     samples isotonic needs to avoid overfitting. Falls back to the raw model
     if calibration can't fit (e.g., a fold with a single class)."""
-    cal = CalibratedClassifierCV(base_model, method="sigmoid", cv=TimeSeriesSplit(n_splits=3, gap=10))
+    # ensemble=False: calibrator is learned from time-ordered CV folds, but the
+    # base model is REFIT on all rows afterwards — otherwise the trees never see
+    # the most recent ~25% of data (exactly the rows recency weighting favors).
+    cal = CalibratedClassifierCV(
+        base_model, method="sigmoid",
+        cv=TimeSeriesSplit(n_splits=3, gap=10), ensemble=False,
+    )
     try:
         cal.fit(X, y, sample_weight=sample_weight)
         return cal
@@ -58,7 +81,7 @@ def _calibrate(base_model, X, y, sample_weight=None):
         return base_model
 
 
-def fit_xgboost(X, y, **overrides):
+def fit_xgboost(X, y, sample_weight=None, **overrides):
     from xgboost import XGBClassifier
     params = dict(
         n_estimators=100, max_depth=3, learning_rate=0.05,
@@ -67,10 +90,12 @@ def fit_xgboost(X, y, **overrides):
         tree_method="hist", verbosity=0, n_jobs=1,
     )
     params.update(overrides)
-    return _calibrate(XGBClassifier(**params), X, y, sample_weight=recency_weights(len(y)))
+    if sample_weight is None:
+        sample_weight = recency_weights(len(y))
+    return _calibrate(XGBClassifier(**params), X, y, sample_weight=sample_weight)
 
 
-def fit_lightgbm(X, y, **overrides):
+def fit_lightgbm(X, y, sample_weight=None, **overrides):
     from lightgbm import LGBMClassifier
     params = dict(
         n_estimators=100, max_depth=3, num_leaves=8, learning_rate=0.05,
@@ -78,10 +103,12 @@ def fit_lightgbm(X, y, **overrides):
         reg_lambda=1.0, random_state=42, verbosity=-1, n_jobs=1,
     )
     params.update(overrides)
-    return _calibrate(LGBMClassifier(**params), X, y, sample_weight=recency_weights(len(y)))
+    if sample_weight is None:
+        sample_weight = recency_weights(len(y))
+    return _calibrate(LGBMClassifier(**params), X, y, sample_weight=sample_weight)
 
 
-def fit_catboost(X, y, **overrides):
+def fit_catboost(X, y, sample_weight=None, **overrides):
     from catboost import CatBoostClassifier
     params = dict(
         iterations=100, depth=3, learning_rate=0.05,
@@ -89,30 +116,36 @@ def fit_catboost(X, y, **overrides):
         thread_count=1, allow_writing_files=False,
     )
     params.update(overrides)
-    return _calibrate(CatBoostClassifier(**params), X, y, sample_weight=recency_weights(len(y)))
+    if sample_weight is None:
+        sample_weight = recency_weights(len(y))
+    return _calibrate(CatBoostClassifier(**params), X, y, sample_weight=sample_weight)
 
 
-def fit_hist_gbm(X, y, **overrides):
+def fit_hist_gbm(X, y, sample_weight=None, **overrides):
     from sklearn.ensemble import HistGradientBoostingClassifier
     params = dict(
         max_iter=100, max_depth=3, learning_rate=0.05,
         l2_regularization=1.0, random_state=42,
     )
     params.update(overrides)
-    return _calibrate(HistGradientBoostingClassifier(**params), X, y, sample_weight=recency_weights(len(y)))
+    if sample_weight is None:
+        sample_weight = recency_weights(len(y))
+    return _calibrate(HistGradientBoostingClassifier(**params), X, y, sample_weight=sample_weight)
 
 
-def fit_random_forest(X, y, **overrides):
+def fit_random_forest(X, y, sample_weight=None, **overrides):
     from sklearn.ensemble import RandomForestClassifier
     params = dict(
         n_estimators=200, max_depth=8, min_samples_leaf=20,
         random_state=42, n_jobs=1,
     )
     params.update(overrides)
-    return _calibrate(RandomForestClassifier(**params), X, y, sample_weight=recency_weights(len(y)))
+    if sample_weight is None:
+        sample_weight = recency_weights(len(y))
+    return _calibrate(RandomForestClassifier(**params), X, y, sample_weight=sample_weight)
 
 
-def fit_logistic(X, y, **overrides):
+def fit_logistic(X, y, sample_weight=None, **overrides):
     """Standardize features then fit L2 logistic regression. Returns a Pipeline."""
     from sklearn.linear_model import LogisticRegression
     from sklearn.pipeline import Pipeline
@@ -146,6 +179,7 @@ def walk_forward_predict(
     step_size: int = 60,
     purge: int = 10,
     embargo: int = 0,
+    horizon: int = 10,
     **fit_kwargs,
 ) -> pd.Series:
     """Generic walk-forward driver. Returns P(up) series aligned to features_df.index.
@@ -169,9 +203,10 @@ def walk_forward_predict(
 
     i = train_size
     while i < n:
-        # Purge: drop the last `purge` rows of the training window to avoid
-        # overlapping forward-return labels leaking into the test period.
-        train_end = i - purge if purge > 0 else i
+        # Purge: drop the tail of the training window so no training label's
+        # forward window overlaps the test period. Floor at `horizon` — a
+        # caller passing horizon=20 with the default purge would leak.
+        train_end = i - max(purge, horizon)
         train = features_df.iloc[i - train_size: train_end].dropna(subset=feature_cols + ["target"])
 
         # Embargo: skip rows immediately after the training cutoff
@@ -193,6 +228,8 @@ def walk_forward_predict(
                 i += step_size
                 continue
 
+            if "date" in train.columns and "sample_weight" not in fit_kwargs:
+                fit_kwargs = dict(fit_kwargs, sample_weight=date_recency_weights(train["date"]))
             model = fit_fn(X_train, y_train, **fit_kwargs)
             X_test = test[feature_cols].astype(float).to_numpy()
             proba = model.predict_proba(X_test)[:, 1]

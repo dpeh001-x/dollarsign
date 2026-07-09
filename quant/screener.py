@@ -125,7 +125,7 @@ def _pool_predict(
             if fit_fn is None:
                 continue
             try:
-                fitted_models.append(fit_fn(X, y))
+                fitted_models.append(fit_fn(X, y, sample_weight=_models.date_recency_weights(train["date"])))
             except Exception as e:
                 logger.warning("ensemble fit %s on %s: %s", name, pool_label, e)
     else:

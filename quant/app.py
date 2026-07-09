@@ -149,7 +149,7 @@ MIN_EDGE_SHARPE = 0.3
 START_ISO = (date.today() - timedelta(days=4 * 365)).isoformat()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
 def load_bars(sym: str) -> pd.DataFrame:
     df = sources.get_bars(sym, START_ISO, use_cache=True)
     df = indicators.attach_all(df)
@@ -157,7 +157,7 @@ def load_bars(sym: str) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
 def load_macro() -> pd.DataFrame | None:
     try:
         return macro_src.get_market_context(START_ISO, date.today().isoformat())
@@ -165,7 +165,7 @@ def load_macro() -> pd.DataFrame | None:
         return None
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
 def load_analyst(sym: str) -> dict | None:
     view = analyst_src.get_analyst_view(sym)
     if view is None:
@@ -186,12 +186,24 @@ def load_analyst(sym: str) -> dict | None:
     }
 
 
-@st.cache_data(show_spinner=False)
+NON_US_CLOSE_SUFFIXES = (".HK", ".SI", ".SS", ".SZ", ".T", ".L", ".AX", ".NS")
+
+
+def macro_for(sym: str) -> pd.DataFrame | None:
+    """Macro frame lagged one day for markets that close before US data
+    exists for that date — same-day VIX/SPY closes are look-ahead there."""
+    m = load_macro()
+    if m is not None and sym.endswith(NON_US_CLOSE_SUFFIXES):
+        return m.shift(1)
+    return m
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
 def get_ml_signal(sym: str, data_ver: str) -> dict:
     """Ensemble ML signal at horizon=10 — the horizon the edge gate verifies
     and the exit plan assumes. (Picking the max-confidence of several
     correlated horizons inflates confidence: winner's curse.)"""
-    macro_df = load_macro()
+    macro_df = macro_for(sym)
     try:
         predictor = ml.EnsemblePredictor(horizon=10).fit(df, macro_df=macro_df)
         sig = predictor.predict_now(df, macro_df=macro_df)
@@ -201,12 +213,12 @@ def get_ml_signal(sym: str, data_ver: str) -> dict:
         return {"proba": float("nan"), "signal": "flat", "confidence": 0.0, "horizon": None}
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
 def check_edge(sym: str, data_ver: str) -> dict | None:
     """Walk-forward backtest on this exact symbol: does the model actually
     have a historical edge here? None = can't verify = don't trade."""
     try:
-        macro_df = load_macro()
+        macro_df = macro_for(sym)
         wf = ml.EnsembleWalkForward(train_size=500, step_size=60)
         positions = wf.positions(df, macro_df=macro_df)
         result = backtest.run(df, positions, fee_bps=1.0, slippage_bps=1.0)
