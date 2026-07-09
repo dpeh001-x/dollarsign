@@ -1,0 +1,16 @@
+services:
+  predict:
+    build: .
+    container_name: dollarsign-predict
+    restart: unless-stopped
+    # Bind to localhost only — nginx is the public entry point
+    ports:
+      - "127.0.0.1:8501:8501"
+    volumes:
+      # Persist the parquet price-data cache across restarts
+      - predict-cache:/app/cache
+    environment:
+      - TZ=Asia/Singapore
+
+volumes:
+  predict-cache:
