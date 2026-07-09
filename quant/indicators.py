@@ -50,6 +50,15 @@ def vwap(df: pd.DataFrame, reset_daily: bool = False) -> pd.Series:
     return pv.cumsum() / df["volume"].cumsum()
 
 
+def vwap_rolling(df: pd.DataFrame, length: int = 20) -> pd.Series:
+    """Rolling VWAP over the trailing `length` bars. Unlike cumulative VWAP,
+    this doesn't depend on where the data frame happens to start, so the same
+    historical bar always gets the same value."""
+    typical = (df["high"] + df["low"] + df["close"]) / 3.0
+    pv = typical * df["volume"]
+    return pv.rolling(length).sum() / df["volume"].rolling(length).sum().replace(0, np.nan)
+
+
 def bbands(close: pd.Series, length: int = 20, std: float = 2.0) -> pd.DataFrame:
     """Bollinger Bands. Returns DataFrame with bb_lower, bb_mid, bb_upper, bb_width."""
     mid = close.rolling(length).mean()
@@ -143,7 +152,7 @@ def attach_all(df: pd.DataFrame) -> pd.DataFrame:
     out["ret_20"] = out["close"].pct_change(20)
     out["rsi_14"] = rsi(out["close"], 14)
     out["atr_14"] = atr(out, 14)
-    out["vwap"] = vwap(out)
+    out["vwap"] = vwap_rolling(out, 20)  # rolling, not anchored to arbitrary frame start
     out = out.join(bbands(out["close"], 20, 2.0))
     out = out.join(macd(out["close"]))
     out = out.join(adx(out, 14))

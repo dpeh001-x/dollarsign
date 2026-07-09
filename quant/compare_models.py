@@ -58,6 +58,7 @@ def run_per_symbol(
             proba = models.walk_forward_predict(
                 feats, fit_fn, feature_cols=feat_cols,
                 train_size=train_size, step_size=step_size,
+                purge=10,  # horizon-length purge — without it every window trains on the test window's opening trend
             )
             positions = ml.proba_to_positions(proba)
             positions = positions.reindex(df.index, fill_value=0.0)

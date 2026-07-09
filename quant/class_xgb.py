@@ -172,7 +172,7 @@ def predict_class(
     try:
         from datetime import datetime, timezone
         end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        macro_df = macro_src.get_vix(start, end)
+        macro_df = macro_src.get_market_context(start, end)
     except Exception as e:
         logger.warning("VIX fetch failed, continuing without macro features: %s", e)
         macro_df = None
@@ -221,7 +221,7 @@ def predict_today_for_class_ensemble(
     try:
         from datetime import datetime, timezone
         end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        macro_df = macro_src.get_vix(start, end)
+        macro_df = macro_src.get_market_context(start, end)
     except Exception as e:
         logger.warning("VIX fetch failed, continuing without macro features: %s", e)
         macro_df = None
@@ -318,7 +318,7 @@ def predict_class_ensemble(
     try:
         from datetime import datetime, timezone
         end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        macro_df = macro_src.get_vix(start, end)
+        macro_df = macro_src.get_market_context(start, end)
     except Exception as e:
         logger.warning("VIX fetch failed, continuing without macro features: %s", e)
         macro_df = None
@@ -420,7 +420,15 @@ def predict_today_for_class(
     if not symbol_dfs:
         return {}
 
-    pooled = build_pooled_features(symbol_dfs, horizon=horizon)
+    try:
+        from datetime import datetime, timezone
+        end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        macro_df = macro_src.get_market_context(start, end)
+    except Exception as e:
+        logger.warning("market context fetch failed, continuing without: %s", e)
+        macro_df = None
+
+    pooled = build_pooled_features(symbol_dfs, horizon=horizon, macro_df=macro_df)
     feat_cols = list(ml.FEATURE_COLS)
     train = pooled.dropna(subset=["target"]).dropna(subset=feat_cols)
     if len(train) < 200:

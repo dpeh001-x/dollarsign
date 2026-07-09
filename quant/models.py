@@ -8,9 +8,16 @@ Hyperparameters are tuned to be roughly comparable: ~100 weak learners,
 shallow depth (3), modest learning rate (0.05). Linear baseline is
 included to confirm gradient boosting is actually adding value.
 
-All gradient-boosted models are wrapped with CalibratedClassifierCV (isotonic
-regression, cv=3). Gradient boosters tend to output over-confident probabilities;
-calibration corrects this, which matters for the deadband confidence filter.
+All gradient-boosted models are wrapped with CalibratedClassifierCV
+(sigmoid/Platt) using TimeSeriesSplit folds with a gap — never shuffled
+KFold, which would calibrate on folds that mix past and future. Gradient
+boosters output over-confident probabilities; calibration corrects this,
+which matters for the deadband confidence filter.
+
+Training rows are recency-weighted (exponential decay, ~2 trading-year
+half-life): markets drift, so last quarter's behavior should count more
+than data from three years ago. Callers pass rows in chronological order,
+which every driver in this repo already does.
 """
 from __future__ import annotations
 
@@ -19,15 +26,36 @@ import logging
 import numpy as np
 import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import TimeSeriesSplit
 
 logger = logging.getLogger(__name__)
 
+RECENCY_HALF_LIFE = 504  # trading days (~2y) until a row's weight halves
 
-def _calibrate(base_model, X, y):
-    """Wrap a fitted-or-unfitted model with isotonic calibration."""
-    cal = CalibratedClassifierCV(base_model, method="isotonic", cv=3)
-    cal.fit(X, y)
-    return cal
+
+def recency_weights(n: int, half_life: int = RECENCY_HALF_LIFE) -> np.ndarray:
+    """Exponential-decay sample weights; the last (most recent) row gets 1.0."""
+    age = np.arange(n - 1, -1, -1, dtype=float)
+    return np.power(0.5, age / half_life)
+
+
+def _calibrate(base_model, X, y, sample_weight=None):
+    """Sigmoid (Platt) calibration with time-ordered folds and a 10-bar gap
+    (overlapping 10-day labels straddle fold boundaries otherwise). Sigmoid,
+    not isotonic: our ~160-sample calibration folds are far below the ~1000
+    samples isotonic needs to avoid overfitting. Falls back to the raw model
+    if calibration can't fit (e.g., a fold with a single class)."""
+    cal = CalibratedClassifierCV(base_model, method="sigmoid", cv=TimeSeriesSplit(n_splits=3, gap=10))
+    try:
+        cal.fit(X, y, sample_weight=sample_weight)
+        return cal
+    except Exception as e:
+        logger.debug("calibration failed (%s); using uncalibrated model", e)
+        try:
+            base_model.fit(X, y, sample_weight=sample_weight)
+        except Exception:
+            base_model.fit(X, y)
+        return base_model
 
 
 def fit_xgboost(X, y, **overrides):
@@ -39,7 +67,7 @@ def fit_xgboost(X, y, **overrides):
         tree_method="hist", verbosity=0, n_jobs=1,
     )
     params.update(overrides)
-    return _calibrate(XGBClassifier(**params), X, y)
+    return _calibrate(XGBClassifier(**params), X, y, sample_weight=recency_weights(len(y)))
 
 
 def fit_lightgbm(X, y, **overrides):
@@ -50,7 +78,7 @@ def fit_lightgbm(X, y, **overrides):
         reg_lambda=1.0, random_state=42, verbosity=-1, n_jobs=1,
     )
     params.update(overrides)
-    return _calibrate(LGBMClassifier(**params), X, y)
+    return _calibrate(LGBMClassifier(**params), X, y, sample_weight=recency_weights(len(y)))
 
 
 def fit_catboost(X, y, **overrides):
@@ -61,7 +89,7 @@ def fit_catboost(X, y, **overrides):
         thread_count=1, allow_writing_files=False,
     )
     params.update(overrides)
-    return _calibrate(CatBoostClassifier(**params), X, y)
+    return _calibrate(CatBoostClassifier(**params), X, y, sample_weight=recency_weights(len(y)))
 
 
 def fit_hist_gbm(X, y, **overrides):
@@ -71,7 +99,7 @@ def fit_hist_gbm(X, y, **overrides):
         l2_regularization=1.0, random_state=42,
     )
     params.update(overrides)
-    return _calibrate(HistGradientBoostingClassifier(**params), X, y)
+    return _calibrate(HistGradientBoostingClassifier(**params), X, y, sample_weight=recency_weights(len(y)))
 
 
 def fit_random_forest(X, y, **overrides):
@@ -81,7 +109,7 @@ def fit_random_forest(X, y, **overrides):
         random_state=42, n_jobs=1,
     )
     params.update(overrides)
-    return _calibrate(RandomForestClassifier(**params), X, y)
+    return _calibrate(RandomForestClassifier(**params), X, y, sample_weight=recency_weights(len(y)))
 
 
 def fit_logistic(X, y, **overrides):
@@ -116,7 +144,7 @@ def walk_forward_predict(
     feature_cols: list[str],
     train_size: int = 500,
     step_size: int = 60,
-    purge: int = 0,
+    purge: int = 10,
     embargo: int = 0,
     **fit_kwargs,
 ) -> pd.Series:

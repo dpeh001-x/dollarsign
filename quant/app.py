@@ -142,7 +142,7 @@ MIN_CONFIDENCE = 0.25
 # Proven-edge gate: BUY/SELL only fires if the walk-forward backtest on THIS
 # symbol historically cleared these bars.
 MIN_EDGE_WINRATE = 0.55
-MIN_EDGE_TRADES = 15
+MIN_EDGE_TRADES = 30
 MIN_EDGE_SHARPE = 0.3
 
 # 4 years: ~1000 bars → 500 to train walk-forward + ~500 out-of-sample to verify.
@@ -160,7 +160,7 @@ def load_bars(sym: str) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def load_macro() -> pd.DataFrame | None:
     try:
-        return macro_src.get_vix(START_ISO, date.today().isoformat())
+        return macro_src.get_market_context(START_ISO, date.today().isoformat())
     except Exception:
         return None
 
@@ -187,25 +187,22 @@ def load_analyst(sym: str) -> dict | None:
 
 
 @st.cache_data(show_spinner=False)
-def get_ml_signal(sym: str, _df_hash: int) -> dict:
-    """Ensemble ML signal at multiple horizons; return the strongest signal."""
+def get_ml_signal(sym: str, data_ver: str) -> dict:
+    """Ensemble ML signal at horizon=10 — the horizon the edge gate verifies
+    and the exit plan assumes. (Picking the max-confidence of several
+    correlated horizons inflates confidence: winner's curse.)"""
     macro_df = load_macro()
-    signals: list[dict] = []
-    for horizon in (5, 10, 20):
-        try:
-            predictor = ml.EnsemblePredictor(horizon=horizon).fit(df, macro_df=macro_df)
-            sig = predictor.predict_now(df, macro_df=macro_df)
-            sig["horizon"] = horizon
-            signals.append(sig)
-        except Exception:
-            continue
-    if not signals:
+    try:
+        predictor = ml.EnsemblePredictor(horizon=10).fit(df, macro_df=macro_df)
+        sig = predictor.predict_now(df, macro_df=macro_df)
+        sig["horizon"] = 10
+        return sig
+    except Exception:
         return {"proba": float("nan"), "signal": "flat", "confidence": 0.0, "horizon": None}
-    return max(signals, key=lambda s: s.get("confidence", 0.0))
 
 
 @st.cache_data(show_spinner=False)
-def check_edge(sym: str, _df_hash: int) -> dict | None:
+def check_edge(sym: str, data_ver: str) -> dict | None:
     """Walk-forward backtest on this exact symbol: does the model actually
     have a historical edge here? None = can't verify = don't trade."""
     try:
@@ -309,10 +306,10 @@ with st.spinner("Fetching Wall Street analyst consensus..."):
     analyst = load_analyst(symbol)
 
 with st.spinner("Running ML ensemble..."):
-    ml_sig = get_ml_signal(symbol, len(df))
+    ml_sig = get_ml_signal(symbol, str(df.index[-1]))
 
 with st.spinner(f"Verifying the model's track record on {symbol} (walk-forward backtest)..."):
-    edge = check_edge(symbol, len(df))
+    edge = check_edge(symbol, str(df.index[-1]))
 
 # ─── Compute ───
 trend_label, trend_emoji = compute_trend(df)

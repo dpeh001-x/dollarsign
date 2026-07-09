@@ -66,7 +66,7 @@ def run(
     gross_ret = held * bar_ret
 
     # Trading costs hit on position changes
-    pos_change = pos.diff().abs().fillna(pos.iloc[0])  # entry costs at first bar
+    pos_change = pos.diff().abs().fillna(abs(pos.iloc[0]))  # entry costs at first bar
     cost_per_change = (fee_bps + slippage_bps) / 10_000
     costs = pos_change * cost_per_change
     net_ret = gross_ret - costs
@@ -75,7 +75,16 @@ def run(
 
     # Trade ledger: track entries/exits
     trades = _extract_trades(pos, df["close"], fee_bps + slippage_bps)
-    metrics = _compute_metrics(net_ret, equity, trades, bars_per_year)
+
+    # Metrics over the ACTIVE period only: the warmup bars before the first
+    # position (500+ flat bars in walk-forward runs) would deflate CAGR and
+    # distort Sharpe if included.
+    active = held.ne(0)
+    if active.any():
+        start_i = int(active.to_numpy().argmax())
+        metrics = _compute_metrics(net_ret.iloc[start_i:], equity.iloc[start_i:], trades, bars_per_year)
+    else:
+        metrics = _compute_metrics(net_ret, equity, trades, bars_per_year)
 
     return BacktestResult(
         equity=equity,
