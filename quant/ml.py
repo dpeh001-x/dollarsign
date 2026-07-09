@@ -41,10 +41,17 @@ FEATURE_COLS: tuple[str, ...] = (
     "macd_hist_norm",
     # Volume features
     "vol_ratio_20", "obv_norm", "hi52_dist",
-    # Macro overlay (VIX)
-    "vix_level", "vix_change",
-    # Regime one-hot
-    *(f"regime_{r}" for r in REGIME_VALUES),
+    # Macro overlay (VIX level + change + term-structure slope)
+    "vix_level", "vix_change", "vix_ts",
+    # Cross-asset context (SPY benchmark momentum + relative strength)
+    "spy_ret_5", "spy_ret_20", "rel_20",
+    # Calendar (turn-of-month flows)
+    "dtm",
+    # NOTE: regime one-hots were removed from the model's inputs. The K-means
+    # regime model is fit on full history, so its labels leak future
+    # distribution into walk-forward tests; its underlying features
+    # (ret_20, vol_20, dd_20, adx, rsi_14) are already direct inputs.
+    # The regime column is still used for DISPLAY and the app's trend veto.
 )
 
 
@@ -52,6 +59,7 @@ def make_features(
     df: pd.DataFrame,
     horizon: int = 5,
     macro_df: pd.DataFrame | None = None,
+    noise_band: float = 0.0,
 ) -> pd.DataFrame:
     """Build a feature + target frame from indicator-attached OHLCV.
 
@@ -111,20 +119,48 @@ def make_features(
         vix_ch = macro_aligned.get("vix_change", pd.Series(np.nan, index=out.index))
         out["vix_level"] = vix_lv.fillna(_VIX_NEUTRAL)
         out["vix_change"] = vix_ch.fillna(0.0)
+        # VIX term structure: VIX/VIX3M > 1 (backwardation) = stress; < 1 = calm
+        out["vix_ts"] = macro_aligned.get("vix_ts", pd.Series(np.nan, index=out.index)).fillna(1.0)
+        # Cross-asset context: broad-market momentum + relative strength.
+        # If the SPY columns are absent entirely (older cache / SPY fetch
+        # failure), zero all three — otherwise rel_20 would silently become a
+        # duplicate of ret_20.
+        if "spy_ret_20" in macro_df.columns:
+            spy5 = macro_aligned.get("spy_ret_5", pd.Series(np.nan, index=out.index)).fillna(0.0)
+            spy20 = macro_aligned["spy_ret_20"].fillna(0.0)
+            out["spy_ret_5"] = spy5
+            out["spy_ret_20"] = spy20
+            out["rel_20"] = out["ret_20"] - spy20  # stays NaN where ret_20 is NaN (row dropped anyway)
+        else:
+            out["spy_ret_5"] = 0.0
+            out["spy_ret_20"] = 0.0
+            out["rel_20"] = 0.0
     else:
         out["vix_level"] = _VIX_NEUTRAL
         out["vix_change"] = 0.0
+        out["vix_ts"] = 1.0
+        out["spy_ret_5"] = 0.0
+        out["spy_ret_20"] = 0.0
+        out["rel_20"] = 0.0
 
-    # Regime one-hot
-    regime = df.get("regime", pd.Series(index=df.index, dtype="object"))
-    for r in REGIME_VALUES:
-        out[f"regime_{r}"] = (regime == r).astype(int)
+    # Calendar: days until month end (turn-of-month flow effect)
+    month_end = out.index + pd.offsets.MonthEnd(0)
+    out["dtm"] = (month_end - out.index).days
 
     # Target: sign of forward N-day return
     fwd_ret = df["close"].pct_change(horizon).shift(-horizon)
     out["fwd_ret"] = fwd_ret
     out["target"] = (fwd_ret > 0).astype("Int8")
     out.loc[fwd_ret.isna(), "target"] = pd.NA
+
+    # Optional noise-band label filter (opt-in, validate via A/B before
+    # enabling in production): drop training labels where the forward move
+    # was negligible relative to volatility — those rows are coin flips that
+    # teach the model nothing about direction.
+    if noise_band > 0:
+        thresh = noise_band * out["atr_pct"].abs() * np.sqrt(float(horizon))
+        small = fwd_ret.abs() < thresh
+        out.loc[small & fwd_ret.notna(), "target"] = pd.NA
 
     return out
 
@@ -162,7 +198,15 @@ def fit_xgb(features_df: pd.DataFrame, **xgb_params) -> XGBClassifier:
     if y.nunique() < 2:
         raise ValueError("Target has only one class — need both up and down samples")
     model = XGBClassifier(**_xgb_defaults(**xgb_params))
-    model.fit(X, y)
+    # Recency weighting (half-life ~2 trading years). Pooled frames carry a
+    # "date" column and interleave many symbols per date — decay by date age
+    # there, or the effective half-life shrinks by the symbol count.
+    import models as _models
+    if "date" in train.columns:
+        w = _models.date_recency_weights(train["date"])
+    else:
+        w = _models.recency_weights(len(y))
+    model.fit(X, y, sample_weight=w)
     return model
 
 
@@ -326,8 +370,8 @@ class EnsembleWalkForward:
     long_thresh: float = 0.55
     short_thresh: float = 0.45
     model_names: tuple[str, ...] = ENSEMBLE_MODELS
-    purge: int = 10   # drop last `horizon` rows from each training window
-    embargo: int = 5  # skip first `horizon//2` rows of each test window
+    purge: int = 10   # effective purge is max(purge, horizon) — see fit_predict
+    embargo: int = 0  # forward-sliding WF trains strictly before test; embargo is pure sample loss
 
     def fit_predict(self, df_with_indicators: pd.DataFrame, macro_df: pd.DataFrame | None = None) -> pd.Series:
         import models as _models
@@ -340,9 +384,14 @@ class EnsembleWalkForward:
         feat_cols = list(FEATURE_COLS)
         proba_out = pd.Series(np.nan, index=feats.index, dtype=float)
 
+        # Note: probabilities are EQUAL-weight averaged deliberately. The
+        # forecast-combination literature ("combination puzzle") shows
+        # performance-based weights estimated from a handful of overlapping
+        # 10-day windows chase noise; with a few correlated learners, equal
+        # weights are the robust choice.
         i = self.train_size
         while i < n:
-            train_end = i - self.purge if self.purge > 0 else i
+            train_end = i - max(self.purge, self.horizon)
             train = feats.iloc[i - self.train_size: train_end].dropna(subset=feat_cols + ["target"])
             test_start = i + self.embargo
             test_end = min(i + self.step_size, n)
@@ -403,8 +452,8 @@ class StackingWalkForward:
     long_thresh: float = 0.55
     short_thresh: float = 0.45
     model_names: tuple[str, ...] = ENSEMBLE_MODELS
-    purge: int = 10
-    embargo: int = 5
+    purge: int = 10   # effective purge is max(purge, horizon)
+    embargo: int = 0
 
     def fit_predict(self, df_with_indicators: pd.DataFrame, macro_df: pd.DataFrame | None = None) -> pd.Series:
         import models as _models
@@ -422,7 +471,7 @@ class StackingWalkForward:
 
         i = self.train_size
         while i < n:
-            train_end = i - self.purge if self.purge > 0 else i
+            train_end = i - max(self.purge, self.horizon)
             train = feats.iloc[i - self.train_size: train_end].dropna(subset=feat_cols + ["target"])
             test_start = i + self.embargo
             test_end = min(i + self.step_size, n)
@@ -504,8 +553,8 @@ class WalkForwardModel:
     long_thresh: float = 0.55
     short_thresh: float = 0.45
     xgb_params: dict | None = None
-    purge: int = 10   # drop last N training rows to prevent label leakage
-    embargo: int = 5  # skip N rows after training cutoff before predicting
+    purge: int = 10   # effective purge is max(purge, horizon)
+    embargo: int = 0
 
     def fit_predict(self, df_with_indicators: pd.DataFrame, macro_df: pd.DataFrame | None = None) -> pd.Series:
         feats = make_features(df_with_indicators, horizon=self.horizon, macro_df=macro_df)
@@ -520,7 +569,7 @@ class WalkForwardModel:
 
         i = self.train_size
         while i < n:
-            train_end = i - self.purge if self.purge > 0 else i
+            train_end = i - max(self.purge, self.horizon)
             train_window = feats.iloc[i - self.train_size: train_end]
             test_start = i + self.embargo
             test_end = min(i + self.step_size, n)
