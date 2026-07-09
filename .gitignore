@@ -36,3 +36,7 @@ dist/
 build/
 *.egg
 node_modules/
+
+# Throwaway / scratch scripts
+**/_*.py
+!**/__init__.py
