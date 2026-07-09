@@ -25,6 +25,9 @@ class AnalystView:
     recommendation: str | None     # 'strong_buy', 'buy', 'hold', 'sell', 'strong_sell'
     current_price: float | None    # spot price from yfinance
     upside_pct: float | None       # (mean_target / current_price - 1) * 100
+    name: str | None = None        # company short name, e.g. "Tencent Holdings"
+    currency: str | None = None    # quote currency, e.g. "USD", "HKD"
+    rec_mean: float | None = None  # 1.0 (strong buy) .. 5.0 (strong sell)
 
     @property
     def direction(self) -> str:
@@ -71,6 +74,8 @@ def get_analyst_view(symbol: str) -> AnalystView | None:
         except (TypeError, ValueError, ZeroDivisionError):
             upside = None
 
+    rec_mean = info.get("recommendationMean")
+
     return AnalystView(
         mean_target=float(mean) if mean is not None else None,
         high_target=float(high) if high is not None else None,
@@ -79,4 +84,7 @@ def get_analyst_view(symbol: str) -> AnalystView | None:
         recommendation=str(rec) if rec else None,
         current_price=float(price) if price else None,
         upside_pct=upside,
+        name=info.get("shortName") or info.get("longName"),
+        currency=info.get("currency"),
+        rec_mean=float(rec_mean) if rec_mean is not None else None,
     )
