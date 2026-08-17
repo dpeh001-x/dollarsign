@@ -48,18 +48,25 @@ IDX_STRONG_LONG = 6
 
 @dataclass
 class TradeSignal:
-    proba: float                   # P(up), 0..1
+    proba: float                   # raw P(up) from the model, 0..1
     direction: int                 # -1, 0, +1
     tier_idx: int                  # 0..6 index into TIERS
     tier: str                      # tier key, e.g. "STRONG_LONG"
     label: str                     # display label, e.g. "STRONG BUY"
     color: str
     conviction: int                # 1..5
-    model_confidence: float        # |P-0.5|*2
+    model_confidence: float        # |P-0.5|*2 — uncalibrated
     trend_score: float
     momentum_score: float
     confluence: str                # "aligned" | "mixed" | "opposed" | "neutral"
     reasoning: list[str] = field(default_factory=list)
+    # Optional: filled in when we have a calibrator or earnings data
+    calibrated_proba: float | None = None
+    empirical_hit_rate: float | None = None
+    hit_rate_n_samples: int | None = None
+    earnings_in_days: int | None = None        # trading days until next earnings
+    in_earnings_blackout: bool = False
+    vetoed: bool = False                       # True if event filter forced FLAT
 
 
 def _proba_to_tier_idx(p: float) -> int:
@@ -161,8 +168,20 @@ def classify_signal(
     momentum_score: float,
     adx: float = float("nan"),
     rsi: float = float("nan"),
+    calibrated_proba: float | None = None,
+    empirical_hit_rate: float | None = None,
+    hit_rate_n_samples: int | None = None,
+    earnings_in_days: int | None = None,
+    blackout_window: int = 5,
 ) -> TradeSignal:
-    """Map model probability + technical context to a tiered TradeSignal."""
+    """Map model probability + technical context to a tiered TradeSignal.
+
+    New optional inputs:
+      calibrated_proba: isotonic-mapped probability (from calibration.Calibrator)
+      empirical_hit_rate: historical hit rate at this probability band
+      earnings_in_days: trading days until next scheduled earnings (None = unknown)
+      blackout_window: tier vetoed to FLAT if 0 ≤ earnings_in_days ≤ this
+    """
     base_idx = _proba_to_tier_idx(proba)
     base_tier = TIERS[base_idx]
     base_direction = base_tier[3]
@@ -174,10 +193,19 @@ def classify_signal(
 
     conviction = _conviction(proba, trend_score, momentum_score, adx, rsi, direction, confluence)
 
-    reasoning: list[str] = [
-        f"Model P(up) = {proba:.1%} → base tier {base_tier[1]}",
-        f"Trend score {trend_score:+.2f}, momentum score {momentum_score:+.2f}",
-    ]
+    reasoning: list[str] = []
+    raw_label = f"P(up) raw {proba:.1%}"
+    if calibrated_proba is not None and abs(calibrated_proba - proba) > 0.02:
+        raw_label += f" → calibrated {calibrated_proba:.1%}"
+    reasoning.append(f"Model: {raw_label} → base tier {base_tier[1]}")
+    reasoning.append(f"Trend score {trend_score:+.2f}, momentum score {momentum_score:+.2f}")
+
+    if empirical_hit_rate is not None and hit_rate_n_samples and hit_rate_n_samples >= 20:
+        reasoning.append(
+            f"Historical hit rate at this confidence band: "
+            f"{empirical_hit_rate:.0%} (over {hit_rate_n_samples} prior walk-forward predictions)"
+        )
+
     if base_idx != final_idx:
         if confluence == "aligned":
             reasoning.append(f"Technicals AGREE with model — tier upgraded to {final_tier[1]}")
@@ -199,6 +227,28 @@ def classify_signal(
     elif direction < 0 and not np.isnan(rsi) and rsi < 20:
         reasoning.append(f"⚠ RSI {rsi:.0f} extremely oversold — late-entry risk for shorts, conviction reduced")
 
+    # ─── Earnings blackout: optionally veto a non-flat signal ───
+    in_blackout = (
+        earnings_in_days is not None
+        and 0 <= earnings_in_days <= blackout_window
+    )
+    vetoed = False
+    if in_blackout and direction != 0:
+        reasoning.append(
+            f"⚠ EARNINGS in {earnings_in_days} trading day{'s' if earnings_in_days != 1 else ''} — "
+            f"signal vetoed to FLAT (technical models don't survive EPS surprises)"
+        )
+        final_idx = IDX_FLAT
+        final_tier = TIERS[IDX_FLAT]
+        direction = 0
+        conviction = 1
+        vetoed = True
+    elif earnings_in_days is not None and 0 <= earnings_in_days <= blackout_window + 5 and direction != 0:
+        reasoning.append(
+            f"Note: earnings in {earnings_in_days} trading days — outside {blackout_window}-day blackout "
+            f"but consider sizing down or closing before report"
+        )
+
     return TradeSignal(
         proba=proba, direction=direction,
         tier_idx=final_idx, tier=final_tier[0], label=final_tier[1], color=final_tier[2],
@@ -207,6 +257,12 @@ def classify_signal(
         trend_score=trend_score, momentum_score=momentum_score,
         confluence=confluence,
         reasoning=reasoning,
+        calibrated_proba=calibrated_proba,
+        empirical_hit_rate=empirical_hit_rate,
+        hit_rate_n_samples=hit_rate_n_samples,
+        earnings_in_days=earnings_in_days,
+        in_earnings_blackout=in_blackout,
+        vetoed=vetoed,
     )
 
 
